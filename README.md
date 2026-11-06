@@ -32,6 +32,8 @@ Read the numbered documents in order; each builds only on the ones before it.
 
 ## Development
 
+Feature specifications are tracked as local Markdown issues. The [long-term memory specification](.scratch/long-term-memory/spec.md) describes the proposed file-backed memory subsystem, bounded model inputs, and stateless background processing. Its status is `ready-for-agent`; the feature is not implemented yet.
+
 `pnpm check` runs the typecheck, the tests and the build.
 
 ## License

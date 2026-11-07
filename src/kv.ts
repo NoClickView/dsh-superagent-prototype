@@ -3,6 +3,7 @@
  * Readers and writers refer to a record by its entry here so each key is spelled once with its value type.
  */
 import type { PromptVersion } from './app/prompts.ts'
+import type { RedeliveryRecord } from './app/redelivery.ts'
 import type { SettingsVersion } from './app/store.ts'
 import type { SettingsSave } from './policy.ts'
 import type { Retry } from './sources/github.ts'
@@ -31,6 +32,11 @@ export const KV = {
     builtIn: family<string, [base: string]>('prompt-built-in:') },
   /** Runtime: the main Session's ID. */
   runtime: { masterId: record<string>('master-id') },
+  /**
+   * Memory: the redelivery position — the captures the receiving boundary refused and still holds, with the count its bound has
+   * cost — written only by `Redelivery`, inside the transaction of the business fact that was not accepted.
+   */
+  memory: { redelivery: record<RedeliveryRecord>('memory-redelivery') },
   /** Sessions: prompt revisions each Session has worked under, ordered oldest first; the last entry (`.at(-1)`) is its active revision. */
   sessions: { prompts: family<number[], [session: string]>('session-prompts:') },
   /** Schema 11 migration: legacy main-Session queues imported into the effect table. */

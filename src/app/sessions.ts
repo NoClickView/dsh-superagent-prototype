@@ -1,7 +1,7 @@
 /** Lifecycle, prompt/tool/skill decoration, message delivery, and budget retry tracking for orchestrator and worker DSH sessions. */
 import type { Context } from '@deepseek-ai/cordis'
 import type { Agent } from '@deepseek-ai/dsh-agent'
-import type { MessageId } from '@deepseek-ai/dsh-llm'
+import type { GenerateOptions, MessageId, StreamChunk } from '@deepseek-ai/dsh-llm'
 import { scopeParentOf } from '@deepseek-ai/dsh-scope'
 import type { SessionId } from '@deepseek-ai/dsh-session'
 import { dirname } from 'node:path'
@@ -9,9 +9,12 @@ import { z } from 'zod'
 import { key, liveTicket, type Ticket } from '../core/index.ts'
 import { mandateInstructions, ticketOfSession } from '../executor/dsh.ts'
 import type { HealthEntry } from '../infra/health.ts'
+import { measureFinalRequest, measureVisible, refusal, refusalMessage, routeDecides, type PageRecord, type RequestBudget, type RequestRecord,
+  type RouteFacts } from './budget.ts'
 import { AgentDelivery, messageId } from './delivery.ts'
 import type { Effects } from './effects.ts'
 import type { Variable } from './execution-environment.ts'
+import { SessionRecovery, type RecoveryAgent, type RecoveryReport, type TitleReport } from './recovery.ts'
 import { RetryHealth } from './retry-health.ts'
 import { initializeRoleModel } from './role-models.ts'
 import { bundledSkills } from './skill-files.ts'
@@ -27,8 +30,12 @@ export interface SessionsHost {
   readonly store: Pick<Store, 'tickets' | 'settings' | 'get' | 'set' | 'keys'>
   readonly prompts: Pick<Prompts, 'current' | 'version' | 'compose' | 'skills'>
   readonly effects: Pick<Effects, 'enqueue' | 'handle' | 'idle' | 'pending'>
+  /** The model-request budget every request is measured against, and that the messages delivered here are paged to fit. */
+  readonly budget: RequestBudget
   /** The `models` health entry, which reports managed sessions waiting on a model-budget retry. */
   readonly health: HealthEntry
+  /** The `budget` health entry, which publishes what the request budget measured, refused and paged. */
+  readonly budgetHealth: HealthEntry
   readonly masterId: string
   readonly lifetime: AbortSignal
   closing(): boolean
@@ -95,11 +102,17 @@ export class Sessions {
   /** Decorated agents mapped to their registered disposers and skill scope until the agent is disposed or `Sessions.dispose()` runs. */
   private readonly bindings = new Map<Agent, SessionBinding>()
   private readonly retryHealth = new RetryHealth()
+  /** Bounded recovery of a Session whose history is over the budget, and the deferral of a Session title that cannot fit. */
+  private readonly recoveries: SessionRecovery
   private readonly ctx: Context
+  /** Releases the process-wide subscriptions `install` took, so a stopped runtime stops answering model calls. */
+  private readonly disposers: (() => void)[] = []
   /** Registers ordered `relay` and `notice` effect handlers that deliver to the main Session. */
   constructor(private readonly host: SessionsHost) {
     this.ctx = host.context
     this.agentDelivery = new AgentDelivery(host.context)
+    this.recoveries = new SessionRecovery({ budget: host.budget,
+      agentOf: (sessionId: string) => this.ctx.agents.get(sessionId as SessionId) as RecoveryAgent | undefined })
     // Deliver relays and notices to the main Session in the order they were queued.
     host.effects.handle('relay', ({ text }, requestId) => this.prompt(host.masterId, requestId, text, 'steer'), { ordered: true })
     host.effects.handle('notice', ({ value, summary }, name) => this.inject(name, value, summary), { ordered: true })
@@ -133,6 +146,9 @@ export class Sessions {
     ctx.on('agent/status', ({ agent, status }) => {
       if (status === 'idle' && !this.host.closing()) { this.retryHealth.clear(agent.id); this.updateModelHealth() }
     })
+    // Every model call the process makes is dispatched through this waterfall — whichever Session asked for it, and whatever
+    // its purpose — so the budget measures the complete request here and answers one that does not fit instead of sending it.
+    this.disposers.push(ctx.on('llm/stream', (options, next) => this.streamed(options, next)))
   }
   /** Resolves or creates session `id` in workspace `cwd`, initializes its role model, decorates it with prompts/skills/tools, sets `danger-full-access` permissions, and renames it to `title`. */
   async ensure(id: string, cwd: string, title: string, role: 'orchestrator' | 'worker'): Promise<Agent> {
@@ -158,15 +174,21 @@ export class Sessions {
     const result = await this.ctx.sessionController.resolveAgent(sessionId as SessionId)
     return !('error' in result) && await this.agentDelivery.holds(result.agent, key(requestId))
   }
-  /** Deliver a message once per request id: to the next turn, the current one, or `inject`ed with its label without waking the agent. */
-  async prompt(sessionId: string, requestId: string, text: string, mode: 'queue' | 'steer' | { inject: string }, authorize?: () => void,
+  /** Deliver a message once per request id: to the next turn, the current one, `recall`ed context without waking the agent, or `inject`ed with its label. */
+  async prompt(sessionId: string, requestId: string, text: string, mode: 'queue' | 'steer' | 'recall' | { inject: string }, authorize?: () => void,
     accepted?: () => void): Promise<void> {
     const result = await this.ctx.sessionController.resolveAgent(sessionId as SessionId)
     if ('error' in result) throw result.error
-    await this.agentDelivery.send(result.agent, key(requestId), text, mode, this.host.lifetime, authorize, accepted)
+    await this.agentDelivery.send(result.agent, key(requestId), this.paged(result.agent, 'message', text), mode, this.host.lifetime, authorize, accepted)
   }
   /** The id of the message `prompt` delivers under `requestId`, which DSH's inbox events name it by. */
   promptedId(requestId: string): MessageId { return messageId(key(requestId)) }
+  /** Every model request the runtime caused, oldest first: `sessionId`'s when named, else every Session and background one. */
+  requests(sessionId?: string): RequestRecord[] { return this.host.budget.requestsOf(sessionId) }
+  /** Every delivered message and tool result the budget had to make smaller, oldest first. */
+  pages(sessionId?: string): PageRecord[] { return this.host.budget.pagesOf(sessionId) }
+  /** Characters the Session's last request left for recalled material, which the memory service assembles recall within. */
+  allowance(sessionId: string): number { return this.host.budget.allowance(sessionId) }
   /** Enqueues a steering relay to the main Session; relays are durable and retried by `Effects` until delivered, at most once per `requestId`. */
   relay(requestId: string, text: string): void { this.host.effects.enqueue('relay', requestId, { text }) }
   /** Enqueues a durable background notice for injection into the main Session; a new notice with the same `name` replaces a still-waiting notice of that `name`. */
@@ -182,7 +204,8 @@ export class Sessions {
     if ('error' in resolved) return
     // Deduplicate by notice name and payload hash so retries are idempotent while updated payloads still deliver.
     const text = JSON.stringify(value)
-    await this.agentDelivery.send(resolved.agent, `notice:${name}:${key(text)}`, text, { inject: summary }, this.host.lifetime)
+    await this.agentDelivery.send(resolved.agent, `notice:${name}:${key(text)}`, this.paged(resolved.agent, 'message', text), { inject: summary },
+      this.host.lifetime)
   }
   /** Returns the current prompt revision, the active prompt revision of each loaded Session, and whether the main Session still has a pending `'prompts'` notice. */
   status() {
@@ -202,17 +225,159 @@ export class Sessions {
   mayRead(sessionId: string, revision: number): boolean {
     return revision === this.promptVersion(sessionId).revision || (this.host.store.get(KV.sessions.prompts(sessionId)) ?? []).includes(revision)
   }
-  /** Returns a tool registrar for `agent` that renders tool output as JSON text and attaches `output.image` as an image when present. */
+  /**
+   * Returns a tool registrar for `agent` that renders tool output as JSON text, paged to the room the request budget has for
+   * it, and attaches `output.image` as an image when present.
+   */
   private registerTool(agent: Agent, binding: SessionBinding): RegisterTool {
     return (name, description, schema, execute) => {
       binding.disposers.push(agent.ctx.tools.register({ name, description, parameters: z.toJSONSchema(schema),
         output: { schema: { type: 'object', additionalProperties: true }, render: (_args, value) => {
-          const text = { type: 'text' as const, text: JSON.stringify(value) }
+          const text = { type: 'text' as const, text: this.paged(agent, 'tool-result', JSON.stringify(value)) }
           const image = value && typeof value === 'object' && 'image' in value ? (value as { image: never }).image : undefined
           return image ? [text, { type: 'image' as const, attachment: image }] : [text]
         } },
         execute: (args, execution) => execute(schema.parse(args), execution.signal) }))
     }
+  }
+  /**
+   * Page one message or tool result to the room the Session's budget leaves for it, or return it whole when it fits. The room is
+   * measured against what the model will actually see of the Session (`measureVisible`) — its surface, not the append-only log a
+   * compaction's replacement has already superseded — so material delivered after a recovery is not squeezed out by history.
+   */
+  private paged(agent: Agent, kind: PageRecord['kind'], text: string): string {
+    const budget = this.host.budget
+    const paged = budget.page(agent.id, kind, text, budget.room(measureVisible(agent.session), agent.id))
+    this.reportBudget()
+    return paged
+  }
+  /**
+   * Measure one model request where DSH hands it to an adapter and let it through or refuse it: the system prompt travels inside
+   * the messages, the tool definitions beside them, and the conversation and its tool results follow. What is measured is not the
+   * request this listener is handed but the one DSH makes of it before the adapter: the route's own tool history is expanded into
+   * the declarations, or left out when the route reads none, and a request image becomes a placeholder on a route without image
+   * input (`measureFinalRequest`). Measuring the request as it arrived is what once let a request approved at five characters
+   * reach its adapter at nine thousand. It arrives assembled and deep frozen, so nothing here can make it smaller — the parts that
+   * can be paged are paged by whoever delivers them — and a request that does not fit is answered with a refusal instead. That
+   * includes DSH's own compaction and Session-title calls: they are recorded with their purpose and held to the same limit, so an
+   * over-limit send is never recorded as a recovery that succeeded. Liveness comes from bounded work instead — a Session whose
+   * history is over is restored by `SessionRecovery`, one compacted step at a time, each step a request this boundary measures and
+   * lets through only if it fits. A request whose final size cannot be established is refused too, because a request nobody can
+   * size is not one this runtime can report as inside its budget.
+   */
+  private async *streamed(options: GenerateOptions, next: () => AsyncIterable<StreamChunk>): AsyncIterable<StreamChunk> {
+    // A call whose signal is already aborted is never sent, so there is nothing to measure and no budget it could break.
+    if (options.signal?.aborted) { yield* next(); return }
+    const record = this.host.budget.record(options.sessionId as string | undefined, measureFinalRequest(options, await this.routeFacts(options)),
+      options.purpose)
+    this.reportBudget()
+    if (record.action !== 'suspend') { yield* next(); return }
+    this.ctx.logger.warn('dsh-superagent: %s', refusalMessage(record))
+    // The refusal is the budget working, and the Session it refuses is the one thing that can be given its work back: a turn whose
+    // history is over is recovered here, inside the turn that found it, so DSH's own compaction sees an open turn and the next
+    // request of this Session fits. A title is only ever deferred or skipped, and a compaction call the boundary refused leaves the
+    // Session paused until this bounded recovery runs.
+    let note: string | undefined
+    try {
+      note = await this.recoverRefused(record, options.signal)
+    } finally { this.reportBudget() }
+    yield* refusal(record, note)
+  }
+  /**
+   * What a refused request means for its Session, as the note the refusal carries: `undefined` when there is nothing to recover —
+   * a request that belongs to no Session, or a refusal this runtime cannot repair. A turn or background call inside a Session whose
+   * history is what the request was short of is handed to bounded recovery, which compacts that history in steps that each fit; a
+   * refusal with a cause no compaction refunds — a size the runtime could not establish, required parts over on their own, an
+   * unusable budget — is recorded as the pause it is, because a recovery that ran anyway claimed a Session recovered while the same
+   * request was refused again. A title is deferred or skipped with the reason and waits for nothing; a compaction call that was
+   * itself refused leaves the Session paused and names that, because the next turn of the Session is what starts the recovery that
+   * will fit.
+   */
+  private async recoverRefused(record: RequestRecord, signal?: AbortSignal): Promise<string | undefined> {
+    const sessionId = record.sessionId
+    if (sessionId === undefined) return undefined
+    if (record.purpose !== undefined) {
+      this.recoveries.refused(record)
+      const title = this.recoveries.titleOf(sessionId)
+      if (record.purpose === 'session-title' && title !== undefined) return title.reason
+      const paused = this.recoveries.report(sessionId)
+      return paused?.state === 'paused' ? paused.reason : undefined
+    }
+    // A reason on the record means compacting the history is not what the request was short of: only a size refusal with material
+    // the recovery could compact is worth a step, and `unrepairable` records the rest instead of claiming a recovery.
+    const report: RecoveryReport = record.reason === undefined
+      ? await this.recoveries.recover(sessionId, signal)
+      : this.recoveries.unrepairable(sessionId, record)
+    if (report.state === 'recovered')
+      return `the Session was over its history budget and was recovered in ${report.steps} bounded step(s); its next request fits`
+    return `the Session is paused: ${report.reason ?? 'its history cannot be compacted within the budget'}`
+  }
+  /** Where a Session's bounded recovery stands right now: recovering, recovered, or paused with the reason — it never waits. */
+  recoveryNow(sessionId: string): RecoveryReport | undefined { return this.recoveries.report(sessionId) }
+  /** Wait for `sessionId`'s recovery to settle and answer where it stands, so a caller reads a state rather than a race. */
+  async awaitRecovery(sessionId: string): Promise<RecoveryReport | undefined> {
+    await this.recoveries.settled(sessionId)
+    return this.recoveries.report(sessionId)
+  }
+  /** How a Session's title stands after a budget refusal: deferred until recovery, skipped with its reason, or sent by a retry. */
+  title(sessionId: string): TitleReport | undefined { return this.recoveries.titleOf(sessionId) }
+  /** Wait for the bounded housekeeping work this class started besides the request it handled — the deferred title retries. */
+  async settled(): Promise<void> { await this.recoveries.settled() }
+  /**
+   * The recovery and title state of one Session, as the `budget` health entry publishes it: `recovering` while the runtime compacts
+   * its history in steps, `recovered` once it fits again, and `paused` with the reason when nothing this runtime can do would make
+   * it fit — a title that was deferred or skipped says the same. A reader can therefore tell a Session being recovered from one that
+   * cannot be, which a bare request count could not say.
+   */
+  private recoveryNote(sessionId: string): string {
+    const report = this.recoveries.report(sessionId), title = this.recoveries.titleOf(sessionId)
+    return (report === undefined ? '' : `; the recovery of ${sessionId} is ${report.state}`
+      + (report.state === 'recovered' ? ` after ${report.steps} step(s)` : '')
+      + (report.state === 'paused' && report.reason !== undefined ? ` (${report.reason})` : ''))
+      + (title === undefined ? '' : `; its title is ${title.state}`)
+  }
+  /**
+   * The exact model metadata of the route a request is sent on, when the request's final form depends on it: DSH reads the
+   * route's tool update mode and image support to project a tool history, a deferred definition or an image, and a route that
+   * cannot describe itself leaves the request unmeasurable rather than measurable by assumption. It is the same exact-model query
+   * DSH's own dispatch resolves its projection from (`llm.resolveModelInfo`), so the meter and the dispatch describe one route.
+   */
+  private async routeFacts(options: GenerateOptions): Promise<RouteFacts | undefined> {
+    if (!routeDecides(options)) return undefined
+    const llm = this.ctx.llm as { resolveModelInfo?: (provider: string, model: string, signal?: AbortSignal) => Promise<RouteFacts> } | undefined
+    if (!llm?.resolveModelInfo) return undefined
+    try { return await llm.resolveModelInfo(options.provider, options.model, options.signal) } catch { return undefined }
+  }
+  /**
+   * Publish what the request budget has done: how many requests it measured, how many it refused before the model was called, how
+   * much material it had to cut, and how large the largest request was against the budget in force. It names what the last request
+   * was made of, too: the tool definitions it declared against what the Session's tool history holds, so an overflow shows which
+   * part and which expansion produced it, and why a request it could not measure was refused. It is the operator's view of a
+   * mechanism that otherwise only fails loudly, and it is a health entry rather than a new page: `state` is `paused` while the last
+   * request it measured was one it refused, because that is a Session waiting on the budget rather than a working one, and `error`
+   * when the configured policy cannot be used at all or the last request could not be measured.
+   */
+  private reportBudget(): void {
+    const usage = this.host.budget.usage(), last = usage.last
+    const refused = last?.action === 'suspend'
+    const unmeasured = last?.unmeasured !== undefined
+    const detail = `${usage.requests} requests: ${usage.sent} sent, ${usage.suspended} suspended, ${usage.housekeeping} housekeeping; `
+      + `${usage.pages} materials paged, ${usage.kept} of ${usage.offered} characters kept; largest ${usage.largest} of `
+      + `${usage.budget} characters`
+      + (last === undefined ? '' : `, last ${last.sessionId ?? 'a background request'} at ${last.total}`)
+      + (last?.purpose === undefined ? '' : ` (a ${last.purpose} call)`)
+      + (last?.expansion === undefined ? '' : `, tool definitions ${last.parts.tools} of ${last.expansion.declared} declared and `
+        + `${last.expansion.history} in the Session's tool history`)
+      + (last?.reason === undefined ? '' : `, refused because ${
+        last.reason === 'unmeasured' ? `its final size could not be measured (${last.unmeasured === 'fileProjection'
+          ? 'it carries a file only the adapter dispatch can resolve' : 'its model route could not be resolved'})`
+          : last.reason === 'invalidConfig' ? 'the input budget is not configured usefully'
+            : 'its required parts alone are over the budget'}`)
+      // The two states a person can act on: a Session whose history is being compacted back into its budget, and a title the
+      // budget would not carry. Both are reported beside the requests, so a recovery is never mistaken for a session-level failure.
+      + (last?.sessionId === undefined ? '' : this.recoveryNote(last.sessionId))
+    this.host.budgetHealth.set({ state: usage.budget === 0 || unmeasured ? 'error' : refused ? 'paused' : 'ready',
+      detail: usage.budget === 0 ? `the input budget is not configured usefully; ${detail}` : detail, at: new Date().toISOString() })
   }
   /** Returns `sessionId`'s active model-budget retry state (`{ model_retry }`) for status listings, or `{}` when not waiting on one. */
   modelRetry(sessionId: string | undefined) {
@@ -347,6 +512,6 @@ export class Sessions {
       try { dispose() } catch (error) { this.ctx.logger.warn('dsh-superagent could not release what it registered for a Session: %s', String(error)) }
     }
   }
-  /** Releases prompt sections, skills, and tools registered by `Sessions` across all decorated agents. */
-  dispose(): void { for (const agent of [...this.bindings.keys()]) this.release(agent) }
+  /** Releases prompt sections, skills, and tools registered by `Sessions` across all decorated agents, and its model-request boundary. */
+  dispose(): void { for (const dispose of this.disposers.splice(0)) dispose(); for (const agent of [...this.bindings.keys()]) this.release(agent) }
 }

@@ -62,9 +62,13 @@ export class AgentDelivery {
     const id = messageId(requestId)
     return (await this.history(agent)).ids.has(id) || [...agent.inbox.nextTurn, ...agent.inbox.nextStep].some(message => deliveryId(message) === id)
   }
-  /** Delivers once to the selected inbox, or injects into history without waking the agent, and flushes Session persistence before acknowledging the producer. */
-  async send(agent: Agent, requestId: string, text: string, mode: 'queue' | 'steer' | { inject: string }, signal: AbortSignal, authorize?: () => void,
-    accepted?: () => void): Promise<void> {
+  /**
+   * Delivers once to the selected inbox, or injects into history without waking the agent, and flushes Session persistence before
+   * acknowledging the producer. `recall` is memory's own form: it joins the history as context the model reads with its next request,
+   * is labelled by its own text, and the request budget counts it as recalled material rather than as something a person said.
+   */
+  async send(agent: Agent, requestId: string, text: string, mode: 'queue' | 'steer' | 'recall' | { inject: string }, signal: AbortSignal,
+    authorize?: () => void, accepted?: () => void): Promise<void> {
     signal.throwIfAborted()
     const seen = await this.history(agent)
     signal.throwIfAborted()
@@ -74,9 +78,9 @@ export class AgentDelivery {
     const pending = [...agent.inbox.nextTurn, ...agent.inbox.nextStep].some(message => deliveryId(message) === id)
     if (!seen.ids.has(id) && !pending) {
       const source = typeof mode === 'object' ? { kind: 'dsh-superagent' as const, form: 'notice' as const, summary: mode.inject }
-        : { kind: 'dsh-superagent' as const, form: 'relay' as const }
+        : { kind: 'dsh-superagent' as const, form: mode === 'recall' ? 'recall' as const : 'relay' as const }
       const message = freezeMessage({ id, role: 'user' as const, content: [{ type: 'text' as const, text }], source })
-      if (typeof mode === 'object') { agent.inject(message); seen.ids.add(id) }
+      if (typeof mode === 'object' || mode === 'recall') { agent.inject(message); seen.ids.add(id) }
       else if (mode === 'steer') agent.steer(message)
       else agent.followup(message)
     }

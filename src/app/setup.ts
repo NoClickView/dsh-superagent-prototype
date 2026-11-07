@@ -1,10 +1,14 @@
-/** Probes repository and account CLIs, configures the worker execution environment and command shims, and tracks setup readiness. */
+/** Probes repository and account CLIs, configures the worker execution environment and command shims, tracks setup readiness, and
+ * checks the boundary that keeps an agent's shell out of the long-term memory files. */
 import type { Context } from '@deepseek-ai/cordis'
+import { join } from 'node:path'
 import { UserError } from '../core/index.ts'
 import { SETUP_FIELDS, resolveDeployment, resolveFeishuBot, workerProbe, type Deployment, type Machine } from '../deployment.ts'
 import { agentVariables, applyEnvironment, verifyEnvironment, withoutDirectory, workerBin, writeEnvironment } from '../infra/environment.ts'
+import { probeIsolation, type IsolationReport } from '../infra/isolation.ts'
 import type { Settings, SettingsBlock } from '../policy.ts'
 import { SetupError, type SetupProblem } from '../setup.ts'
+import { executionRoot } from './execution-environment.ts'
 
 export interface SetupHost {
   readonly context: Context
@@ -72,6 +76,24 @@ export class Setup {
   private probe() {
     const { context, machine, lifetime } = this.host
     return workerProbe(context.subprocess, machine.stateDir, machine.stateDir, lifetime)
+  }
+  /**
+   * Check the boundary the long-term memory's single writer needs, and report what the deployment actually is. It runs after the
+   * Sessions exist, because the preset they run under is what a shell runs under, and it never fails startup: a check this deployment
+   * cannot make is a boundary it did not prove, which refuses memory writes instead of leaving the operator with no runtime at all.
+   */
+  async isolation(session: unknown, settings: Settings): Promise<IsolationReport> {
+    const { context, machine } = this.host
+    const probe = this.probe()
+    const unproven = (reason: string): IsolationReport => ({ proven: false, gates: [], observed: [], detail: reason })
+    try {
+      return await probeIsolation({ stateDir: machine.stateDir, dir: join(machine.stateDir, 'memory'),
+        workspaces: [executionRoot(settings, machine.stateDir)],
+        sandbox: () => context.get('sandbox') as unknown, presets: () => context.get('permissionPresets') as unknown,
+        session: () => session,
+        // Windows has no ACL API in Node, so the directory's access control is read the way the environment checks read git.
+        acl: async dir => await probe(['icacls', dir]).catch(() => undefined) })
+    } catch (error) { return unproven(`the deployment boundary could not be checked: ${String(error)}`) }
   }
   private async resolve(settings: Settings): Promise<Deployment> {
     const { context, machine, lifetime } = this.host

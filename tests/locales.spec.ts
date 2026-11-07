@@ -25,11 +25,14 @@ it('words a reason by its code with its values, each of a batch, and words a per
 })
 
 it('names every health entry of dsh-superagent itself, which the overview shows when it fails', () => {
-  // Each entry by its writer: dsh-superagent, the model budget retries, every kind of the effect queue, Channel messages, the
-  // Executor and the unavailable Evals of the last hour.
-  const entries = { runtime: 0, models: 0, reply: 0, worker: 0, assessment: 0, launch: 0, delivery: 0, relay: 0,
-    notice: 0, evals: 0 } satisfies Record<EffectKind | 'runtime' | 'models' | 'reply' | 'worker' | 'evals', 0>
+  // Each entry by its writer: dsh-superagent, the model budget retries and the request-budget usage, every kind of the effect queue,
+  // Channel messages, the Executor, the long-term memory and its background work, and the unavailable Evals of the last hour.
+  const entries = { runtime: 0, models: 0, budget: 0, reply: 0, worker: 0, assessment: 0, launch: 0, delivery: 0, relay: 0,
+    notice: 0, memory: 0, 'memory-store': 0, 'memory-background': 0, evals: 0 } satisfies Record<EffectKind | 'runtime' | 'models' | 'budget'
+      | 'reply' | 'worker' | 'evals' | 'memory-store' | 'memory-background', 0>
   expect(Object.keys(entries).filter(name => !(`health.${name}` in zh))).toEqual([])
+  // A word in both languages, not just one: the panel falls back to the key when one is missing.
+  expect(Object.keys(entries).filter(name => !(`health.${name}` in en))).toEqual([])
 })
 
 it('words every refusal the host words by code, in both languages', () => {

@@ -45,10 +45,24 @@ describe('configuration schema', () => {
     const read = machineOf(Config({ stateDir: join(dir, 'state') }))
     // Limits are volatile references that the loader updates in place and callers read when used.
     expect({ ...read, promptMaxChars: read.promptMaxChars.get(), admissionContextMaxPages: read.admissionContextMaxPages.get(),
-      admissionContextTimeoutMs: read.admissionContextTimeoutMs.get() })
-      .toEqual({ stateDir: join(dir, 'state'), promptMaxChars: 100000, admissionContextMaxPages: 10, admissionContextTimeoutMs: 15000 })
+      admissionContextTimeoutMs: read.admissionContextTimeoutMs.get(), requestMaxChars: read.requestMaxChars.get(),
+      requestOutputReserveChars: read.requestOutputReserveChars.get(), requestMeasurementReserveChars: read.requestMeasurementReserveChars.get(),
+      memoryBudgetBytes: read.memoryBudgetBytes.get(), memoryRecallMaxChars: read.memoryRecallMaxChars.get(),
+      memoryRecallWakes: read.memoryRecallWakes.get(), memoryRecallWindowMs: read.memoryRecallWindowMs.get(),
+      memoryPendingMaxItems: read.memoryPendingMaxItems.get(), memoryWriteMode: read.memoryWriteMode.get(),
+      memoryBackgroundMaxCalls: read.memoryBackgroundMaxCalls.get(), memoryBackgroundBatch: read.memoryBackgroundBatch.get(),
+      memoryBackgroundConcurrency: read.memoryBackgroundConcurrency.get(), memoryBackgroundPending: read.memoryBackgroundPending.get(),
+      memoryBackgroundTimeoutMs: read.memoryBackgroundTimeoutMs.get(), memoryBackgroundAttempts: read.memoryBackgroundAttempts.get() })
+      .toEqual({ stateDir: join(dir, 'state'), promptMaxChars: 100000, admissionContextMaxPages: 10, admissionContextTimeoutMs: 15000,
+        requestMaxChars: 400000, requestOutputReserveChars: 32000, requestMeasurementReserveChars: 8000, memoryBudgetBytes: 67_108_864,
+        memoryRecallMaxChars: 4000, memoryRecallWakes: 8, memoryRecallWindowMs: 1_800_000, memoryPendingMaxItems: 256,
+        memoryWriteMode: 'require', memoryBackgroundMaxCalls: 8, memoryBackgroundBatch: 8,
+        memoryBackgroundConcurrency: 1, memoryBackgroundPending: 256, memoryBackgroundTimeoutMs: 60_000, memoryBackgroundAttempts: 2 })
     expect(() => Config(minimal({ stateDir: 'relative/dir' }))).toThrow()
     expect(() => Config(minimal({ stateDir: '~/dir' }))).toThrow()
+    // A budget whose reserves take all of it is refused where the settings are read, not clamped into something nobody set.
+    expect(() => machineOf(Config(minimal({ requestMaxChars: 10000, requestOutputReserveChars: 9000, requestMeasurementReserveChars: 1000 }))))
+      .toThrow('must total less than requestMaxChars')
   })
   it('names keys the configuration does not define, and where the values of older keys live now', () => {
     const raw = minimal({ repository: 'acme/widgets', repositoryPath: '/srv/widgets', blockedCommands: [], author: { name: 'Alice' }, extra: 1 })

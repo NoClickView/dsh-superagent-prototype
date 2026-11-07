@@ -7,7 +7,8 @@ import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { vi, type Mock } from 'vitest'
-import type { UserMessage } from '@deepseek-ai/dsh-llm'
+import { contentHasFile, projectFilesToText, projectToolUpdates } from '@deepseek-ai/dsh-llm'
+import type { GenerateOptions, RequestMessage, StreamChunk, ToolUpdate, UserMessage } from '@deepseek-ai/dsh-llm'
 import { Runtime } from '../../src/app/runtime.ts'
 import { Store } from '../../src/app/store.ts'
 import { SettingsSchema } from '../../src/policy.ts'
@@ -16,6 +17,7 @@ import { githubKind } from '../../src/sources/github.ts'
 import { Commands } from '../../src/infra/commands.ts'
 import { credentialHelper, workerGitConfig } from '../../src/infra/environment.ts'
 import type { Trigger } from '../../src/core/index.ts'
+import type { Machine } from '../../src/deployment.ts'
 import { testMachine } from './deployment.ts'
 
 export const MEMBER = 'ou_alice'
@@ -28,7 +30,12 @@ export function feishu(id: string, text: string, overrides: Record<string, unkno
     mentions: [{ id: 'ou_bot' }], ...overrides }, 'ou_bot', 'cli_bot')!
 }
 
-type RegisteredTool = { name: string; execute: (args: unknown, execution: { signal: AbortSignal }) => Promise<unknown> }
+type RegisteredTool = { name: string; description: string; parameters: unknown; execute: (args: unknown, execution: { signal: AbortSignal }) => Promise<unknown>;
+  output?: { render: (args: unknown, value: unknown) => unknown } }
+/** One system-prompt section a Session registered, whose text DSH evaluates on every model request. */
+type Section = { name: string; text: (context: { signal?: AbortSignal }) => string; interpolate?: boolean }
+/** One event of a Session's model-visible log. */
+type Logged = { type: string; data: unknown }
 type FakeAgent = {
   id: string; status: string; inbox: { nextTurn: UserMessage[]; nextStep: UserMessage[] }
   cancel: Mock; inject: Mock<(message: UserMessage) => void>; steer: Mock<(message: UserMessage) => void>; followup: Mock<(message: UserMessage) => void>
@@ -37,6 +44,71 @@ type FakeAgent = {
 const notice = (id: string, text: string) => ({ id, role: 'user', content: [{ type: 'text', text }], source: { kind: 'tool-jobs', form: 'notice' } }) as unknown as UserMessage
 type HttpHandler = (req: unknown, res: unknown) => Promise<void>
 type Delivery = { sessionId: string; mode: 'queue' | 'steer'; id: string; text: string }
+
+/** The event types that produce a model-visible message, which is what DSH's surface holds. */
+const SURFACE_EVENTS = new Set(['system/message', 'user/message', 'assistant/message', 'tool/result', 'developer/message'])
+/** One event of a Session's append-only log with the sequence DSH stamps on it, which the surface is derived by. */
+type SeqEvent = { readonly seq: number; readonly type: string; readonly data: unknown }
+/**
+ * The model-visible surface of one Session, as DSH derives it: the append-only log replayed with every committed positional
+ * replacement applied. A replacement event names the range it shadows and takes that range's place in the surface; the log-only
+ * `compaction/*` events never enter the model's view.
+ */
+function surfaceOf(log: readonly Logged[]): SeqEvent[] {
+  const shadowed = new Set<number>(), anchors = new Map<number, SeqEvent>(), replacements = new Set<number>()
+  log.forEach((event, seq) => {
+    const op = (event.data as { surfaceOp?: { op?: string; startSeq?: number; endSeq?: number; shadowedSeqs?: number[] } }
+      | undefined)?.surfaceOp
+    if (op?.op !== 'replace' || op.startSeq === undefined || op.endSeq === undefined) return
+    // A replacement's range is a surface POSITION span, so a later one can name a higher start than end. What it shadows is the set of
+    // seqs it recorded, which is the same set DSH publishes in its `compaction/summary` event.
+    const inside = op.shadowedSeqs ?? Array.from({ length: Math.max(0, op.endSeq - op.startSeq + 1) }, (_, offset) => op.startSeq! + offset)
+    if (inside.length === 0) return
+    anchors.set(inside[0]!, { seq, type: event.type, data: event.data })
+    replacements.add(seq)
+    for (const inner of inside) shadowed.add(inner)
+  })
+  const surface: SeqEvent[] = []
+  log.forEach((event, seq) => {
+    const anchor = anchors.get(seq)
+    if (anchor !== undefined) surface.push(anchor)
+    if (shadowed.has(seq) || replacements.has(seq)) return
+    if (SURFACE_EVENTS.has(event.type)) surface.push({ seq, type: event.type, data: event.data })
+  })
+  return surface
+}
+/** The request message one surface event projects, as DSH's own surface does. */
+function messageOf(event: SeqEvent): RequestMessage {
+  const data = (event.data ?? {}) as { content?: unknown; message?: { content?: unknown } }
+  const role = event.type === 'system/message' ? 'system' : event.type === 'tool/result' ? 'tool'
+    : event.type === 'assistant/message' ? 'assistant' : 'user'
+  return { role, content: (event.type === 'user/message' ? data.content : data.message?.content) ?? [] } as RequestMessage
+}
+/** The instruction the fixture's compaction backend appends to the replayed prefix, as DSH's own summarizer does. */
+const COMPACTION_INSTRUCTION = 'Condense the conversation above into a structured checkpoint another model can resume from.'
+/**
+ * The message history DSH derives for the model from `log`: the surface in model-visible order, with every committed replacement
+ * applied, as the messages a request carries. It is what the request budget measures a Session by, so a fake Session answers
+ * `deriveMessages` with it rather than with its append-only log.
+ */
+export function visibleMessages(log: readonly { readonly type: string; readonly data: unknown }[]): RequestMessage[] {
+  return surfaceOf(log).map(messageOf)
+}
+/**
+ * A fake Session as the Runtime measures one: the events its log holds and the messages DSH derives from them for the next request.
+ * A spec that hands the Runtime an agent needs this surface of a Session and nothing more of a real one, so it is built here rather
+ * than by hand in every spec that keeps its own log.
+ * @param id - the Session's id.
+ * @param log - the events its log holds, read on every request.
+ * @param overrides - the header the Session declares, and what appending one of its own events does.
+ */
+export function fakeSession(id: string, log: () => readonly { readonly type: string; readonly data: unknown }[],
+  overrides: { header?: Record<string, unknown>; append?: (type: string, data: unknown) => void } = {}) {
+  return { id, header: overrides.header ?? {}, snapshotEvents: log, requestHeader: () => undefined,
+    append: overrides.append ?? (() => {}), deriveMessages: () => visibleMessages(log()) }
+}
+/** One compaction transaction the fixture's backend ran: the range it selected, and whether it committed a replacement. */
+type CompactionRun = { readonly start: number; readonly end: number; readonly committed: boolean; readonly error?: string }
 
 /**
  * DSH's job registry as the Executor uses it, with DSH's job tools: the jobs a Session can see, their events, a wait and a
@@ -131,9 +203,35 @@ export function subagentRuntime(agents: Map<string, FakeAgent>) {
   return { service, settle, spawn, live: (id: string) => !!children.get(id)?.live }
 }
 
-/** @param seed - writes to the database before the Runtime opens it, such as records an earlier version stored. */
-export async function startRuntime(seed?: (store: Store) => void) {
-  const directory = mkdtempSync(join(tmpdir(), 'orchestrator-host-'))
+/** What a test may put in place of the fixture's own DSH host. */
+export interface HostOptions {
+  /** Services mounted instead of the fixture's, such as a sandbox backend and a permission preset table. */
+  services?: Record<string, unknown>
+  /** Machine settings the deployment under test differs in, such as the mode that gates the memory's writes. */
+  machine?: Partial<Machine>
+  /** A state directory the caller owns: the runtime starts on it, and `stop` leaves it in place. */
+  stateDir?: string
+  /** The model route its adapter declares, which decides how DSH projects a request before the adapter sees it. */
+  route?: RouteUnderTest
+}
+
+/**
+ * The capabilities of the model route the fixture's adapter serves, as a real adapter declares them through
+ * `resolveModel`. Its adapter projects every request with these the way DSH does, so a test observes what the route
+ * actually receives rather than what the caller assembled: an absent `toolUpdate` is a route that reads no tool history.
+ * The route declares no input modalities, which is what an adapter that declares none does.
+ */
+export interface RouteUnderTest {
+  /** The route's tool update mode: how DSH expands the tool history the Session folded. */
+  toolUpdate?: ToolUpdate
+  /** Fail route resolution, as a provider whose adapter cannot describe the model does. */
+  unresolved?: boolean
+}
+
+/** @param seed - writes to the database before the Runtime opens it, such as records an earlier version stored.
+ * @param options - the DSH services, machine settings and state directory a test supplies instead of the defaults. */
+export async function startRuntime(seed?: (store: Store) => void, options: HostOptions = {}) {
+  const directory = options.stateDir ?? mkdtempSync(join(tmpdir(), 'orchestrator-host-'))
   const AGENT = join(directory, 'agent-gh'), BOT = join(directory, 'lark-bot')
   const repository = { default_branch: 'master', permissions: { push: true } }
   vi.spyOn(Commands.prototype, 'gh').mockImplementation(async args => args[1] === 'user' ? { login: 'agent-bot' } : repository)
@@ -164,6 +262,99 @@ export async function startRuntime(seed?: (store: Store) => void) {
   /** Each Session's next step, which takes the messages that wait for one. */
   const steps = new Map<string, () => void>(), claims = new Map<string, () => void>()
   const tools = new Map<string, Map<string, RegisteredTool>>()
+  /** The system-prompt section each Session registered, which DSH evaluates on every model request. */
+  const sections = new Map<string, Section>()
+  /** The model-visible log of each Session: the messages its steps took, as DSH records them. */
+  const logs = new Map<string, Logged[]>()
+  /** The tool declarations a Session's next request carries, as DSH folds its registered tools into `tools`. */
+  const definitionsOf = (sessionId: string) =>
+    [...tools.get(sessionId)?.values() ?? []].map(({ name, description, parameters }) => ({ name, description, parameters }))
+  /**
+   * What the fixture's DSH housekeeping services did: every compaction transaction, the state the runtime was in when it asked for a
+   * step, what a test makes happen while a step is in flight, and every title generation the runtime asked for. A test reads this to
+   * see that a step never commits twice, that an interrupted step changed nothing, that recovery was observably in progress, and what
+   * DSH's other housekeeping did to a Session in the middle of a recovery.
+   */
+  const dsh = { compaction: { runs: [] as CompactionRun[], interruptAfter: undefined as number | undefined,
+    duringStep: undefined as (() => Promise<void>) | undefined, observed: [] as string[] }, title: { refreshes: [] as string[] } }
+  /**
+   * DSH's compaction backend as a Session sees it: `compactRegion` replaces one balanced positional range with a summary it asks a
+   * model for. The request is a real one through the same `llm.stream` waterfall every other request takes, so the runtime's budget
+   * measures it; the durable bracket is a `compaction/start`, the summary event and its replacement, and one `compaction/end`. A
+   * failed or interrupted transaction leaves the log without a replacement, which is what makes a retry safe.
+   */
+  const compactionService = (sessionId: string) => ({
+    compactRegion: vi.fn(async (start: number, end: number, _agent: unknown, signal?: AbortSignal) => {
+      const log = logs.get(sessionId)!
+      const compactionId = `compaction-${dsh.compaction.runs.length + 1}`
+      const fail = (error: Error): never => {
+        log.push({ type: 'compaction/end', data: { compactionId, error: error.message } })
+        dsh.compaction.runs.push({ start, end, committed: false, error: error.message })
+        throw error
+      }
+      if (signal?.aborted) return fail(new Error('compaction interrupted'))
+      dsh.compaction.observed.push(runtime.sessions.recoveryNow(sessionId)?.state ?? 'absent')
+      const surface = surfaceOf(log)
+      const startAt = surface.findIndex(node => node.seq === start), endAt = surface.findIndex(node => node.seq === end)
+      if (startAt < 0 || endAt < 0 || startAt > endAt) return fail(new Error(`compactRegion: ${start}-${end} is not a range on the surface`))
+      const callsIn = (event: SeqEvent) => event.type === 'assistant/message'
+        ? ((event.data as { message?: { content?: { type: string }[] } }).message?.content ?? []).filter(block => block.type === 'tool-call').length
+        : 0
+      // Both edges must keep an assistant tool call paired with its results, as DSH's own region validation requires.
+      if (startAt > 0 && surface[startAt - 1]!.type === 'assistant/message' && callsIn(surface[startAt - 1]!) > 0)
+        return fail(new Error('compactRegion: the range starts after a tool call it leaves outside'))
+      const calls = surface.slice(startAt, endAt + 1).reduce((total, node) => total + callsIn(node), 0)
+      if (calls > 0 && endAt + 1 < surface.length && surface[endAt + 1]!.type === 'tool/result')
+        return fail(new Error('compactRegion: the range ends before the results of a call it contains'))
+      log.push({ type: 'compaction/start', data: { compactionId } })
+      const selected = surface.slice(startAt, endAt + 1)
+      const head = surface[0]!.type === 'system/message' && startAt > 0 ? [messageOf(surface[0]!)] : []
+      const messages = [...head, ...selected.map(messageOf),
+        { role: 'user' as const, content: [{ type: 'text' as const, text: COMPACTION_INSTRUCTION }] }] as unknown as RequestMessage[]
+      const chunks: StreamChunk[] = []
+      for await (const chunk of llm.stream({ provider: 'deepseek', model: 'deepseek-chat', messages,
+        tools: definitionsOf(sessionId) as never, sessionId: sessionId as never, purpose: 'compaction', maxTokens: 512,
+        ...(signal === undefined ? {} : { signal }) })) chunks.push(chunk)
+      const refused = chunks.flatMap(chunk => chunk.type === 'finish' && chunk.reason.kind === 'error' ? [chunk.reason.failure] : [])
+      if (refused.length > 0) return fail(new Error(refused[0]!.message))
+      if (dsh.compaction.interruptAfter !== undefined
+        && dsh.compaction.runs.filter(run => run.committed).length >= dsh.compaction.interruptAfter)
+        return fail(new Error('interrupted: the compaction step was interrupted before it committed'))
+      // The step's request has been measured and sent and nothing is committed yet, which is where a test can make DSH's other
+      // housekeeping — naming the Session, say — land while a recovery is in flight.
+      if (dsh.compaction.duringStep !== undefined) await dsh.compaction.duringStep()
+      const checkpoint = { role: 'user' as const, content: [{ type: 'text' as const, text: `checkpoint: ${selected.length} nodes condensed` }],
+        source: { kind: 'compact-checkpoint' as const } }
+      log.push({ type: 'compaction/summary', data: { compactionId, shadowedRange: { start, end },
+        shadowedSeqs: selected.map(node => node.seq) } })
+      log.push({ type: 'user/message', data: { ...checkpoint,
+        surfaceOp: { op: 'replace', startSeq: start, endSeq: end, shadowedSeqs: selected.map(node => node.seq) } } })
+      log.push({ type: 'compaction/end', data: { compactionId } })
+      dsh.compaction.runs.push({ start, end, committed: true })
+      return { compactionId, shadowedRange: { start, end }, shadowedSeqs: selected.map(node => node.seq) }
+    }),
+  })
+  /**
+   * DSH's title service as a Session sees it: one bounded auxiliary request, generated through the same waterfall. The provider
+   * names the Session from the conversation it can see, so its request carries that material exactly as a turn's would and the same
+   * budget decides it; a title the budget refuses reaches no adapter, and `refresh` is how the runtime retries a deferred one once
+   * the Session has recovered.
+   */
+  const titleService = (sessionId: string) => ({
+    refresh: vi.fn(async (_session: unknown, signal?: AbortSignal) => {
+      dsh.title.refreshes.push(sessionId)
+      const messages = surfaceOf(logs.get(sessionId)!).map(messageOf)
+      const chunks: StreamChunk[] = []
+      for await (const chunk of llm.stream({ provider: 'deepseek', model: 'deepseek-chat',
+        messages: [...messages, { role: 'user' as const, content: [{ type: 'text' as const, text: 'Name this Session in three words.' }] }],
+        tools: definitionsOf(sessionId) as never, sessionId: sessionId as never, purpose: 'session-title', maxTokens: 32,
+        ...(signal === undefined ? {} : { signal }) })) chunks.push(chunk)
+      const refused = chunks.flatMap(chunk => chunk.type === 'finish' && chunk.reason.kind === 'error' ? [chunk.reason.failure] : [])
+      if (refused.length > 0) throw new Error(refused[0]!.message)
+      return { title: 'recovered Session', messageSeqs: [], model: { provider: 'deepseek', id: 'deepseek-chat', name: 'deepseek-chat' } }
+    }),
+  })
+
   const deliveries = vi.fn<(request: Delivery) => void>()
   let http!: HttpHandler
   const resolveDefault = async (id: string) => agents.has(id) ? { agent: agents.get(id) } : { error: { code: 'session/not-found' } }
@@ -173,10 +364,14 @@ export async function startRuntime(seed?: (store: Store) => void) {
       const agentCtx = new Context()
       const sessionTools = new Map<string, RegisteredTool>()
       tools.set(sessionId, sessionTools)
+      logs.set(sessionId, [])
       const register = (tool: RegisteredTool) => { sessionTools.set(tool.name, tool); return () => sessionTools.delete(tool.name) }
       agentCtx.reflect.provide('tools', { register, get: () => undefined, restrict: vi.fn(() => () => {}), guard: vi.fn(() => () => {}) })
       agentCtx.reflect.provide('skills', { register: () => () => {} })
-      agentCtx.reflect.provide('systemPrompt', { section: () => () => {} })
+      agentCtx.reflect.provide('systemPrompt', { section: (spec: Section) => { sections.set(sessionId, spec); return () => {} } })
+      // The Session's own preset mounts the compaction backend and the title service, which the runtime's recovery reaches through it.
+      agentCtx.reflect.provide('compaction', compactionService(sessionId))
+      agentCtx.reflect.provide('sessionTitle', titleService(sessionId))
       const inbox = { nextTurn: [] as UserMessage[], nextStep: [] as UserMessage[],
         // A pending message taken out, as DSH's inbox does by its id.
         remove: (id: string) => [inbox.nextTurn, inbox.nextStep].some(list => {
@@ -194,7 +389,10 @@ export async function startRuntime(seed?: (store: Store) => void) {
         for (const message of [...inbox.nextStep.filter(item => !taken.has(item.id)), ...queued]) {
           taken.add(message.id)
           ctx.emit('agent/inbox/claimed', { agent, message, turn } as never)
-          if (!cut) ctx.emit('session/event', session as never, { type: 'user/message', data: message } as never)
+          if (!cut) {
+            logs.get(sessionId)!.push({ type: 'user/message', data: message })
+            ctx.emit('session/event', session as never, { type: 'user/message', data: message } as never)
+          }
         }
       }
       steps.set(sessionId, () => { take(false) })
@@ -210,7 +408,14 @@ export async function startRuntime(seed?: (store: Store) => void) {
         turn++
         take(true)
       })
-      const session = { id: sessionId, snapshotEvents: () => [], requestHeader: () => undefined, append: vi.fn() }
+      const session = { id: sessionId, requestHeader: () => undefined, append: vi.fn(),
+        // DSH stamps a sequence on every log event and derives the model-visible surface from them; the fixture numbers its log the
+        // same way, so a compaction range names what the model would see and not a private array position.
+        snapshotEvents: () => logs.get(sessionId)!.map((event, seq) => ({ ...event, seq })),
+        // The history DSH derives for the next request: the same surface, as the messages a request carries. A range a compaction
+        // replaced is absent from it, which is what makes a measurement of it a measurement of what the model is actually given.
+        deriveMessages: () => visibleMessages(logs.get(sessionId)!),
+        surface: { get nodes() { return surfaceOf(logs.get(sessionId)!).map(node => node.seq) } } }
       let status = 'idle'
       const idle: (() => void)[] = []
       // A cancel drops the inbox unless kept, and the turn it stops ends a moment later, which DSH says.
@@ -238,18 +443,50 @@ export async function startRuntime(seed?: (store: Store) => void) {
   const webServer = { host: '127.0.0.1', port: 3082, register: (route: { handler: HttpHandler }) => { http = route.handler; return () => {} } }
   const jobs = jobRegistry(id => agents.get(id))
   const subagents = subagentRuntime(agents)
-  const services = { agents, llm: { resolveCallConfig: vi.fn(async (value: unknown) => value) }, sessionController: controller,
+  const ctx = new Context()
+  /** The capabilities the fixture's one adapter declares, which a test may change while the Runtime runs. */
+  const modelRoute: RouteUnderTest = { ...options.route }
+  /** The adapter a request reaches when nothing refuses it, which records the request DSH would have sent. */
+  const asked = vi.fn<(options: GenerateOptions) => void>()
+  /**
+   * The request as DSH hands it to its adapter, which is not the one the caller assembled: files become handle text, and
+   * the tool declarations are projected through the route's tool update mode — including the historical definitions
+   * `toolHistory` holds. These are DSH's own projection functions in DSH's own order (`adapterStream`), so what `asked`
+   * records is what a provider would have been sent.
+   */
+  const projected = (options: GenerateOptions): GenerateOptions => {
+    let messages: readonly RequestMessage[] = options.messages
+    if (messages.some(message => contentHasFile(message.content))) messages = projectFilesToText(messages, () => '/attachments/fixture')
+    const projected = projectToolUpdates(messages, options.tools, modelRoute.toolUpdate, options.toolHistory)
+    return { ...options, messages: [...projected.messages],
+      ...(projected.tools === undefined || options.tools === undefined ? {} : { tools: [...projected.tools] }) }
+  }
+  const adapter = (options: GenerateOptions): AsyncIterable<StreamChunk> => {
+    asked(projected(options))
+    return (async function* () {
+      yield { type: 'text-delta', index: 0, text: 'ok' } as StreamChunk
+      yield { type: 'finish', reason: { kind: 'stop' } } as StreamChunk
+    })()
+  }
+  // DSH dispatches every model call, foreground or background, through the `llm/stream` waterfall, which may veto it.
+  const llm = { resolveCallConfig: vi.fn(async (value: unknown) => value),
+    // The exact model metadata the route declares, which is what decides the projection above.
+    resolveModelInfo: vi.fn(async (provider: string, model: string) => {
+      if (modelRoute.unresolved) throw new Error(`no adapter describes ${provider}/${model}`)
+      return { provider, id: model, name: model, ...(modelRoute.toolUpdate === undefined ? {} : { toolUpdate: modelRoute.toolUpdate }) }
+    }),
+    stream: (options: GenerateOptions) => ctx.waterfall(llm as never, 'llm/stream', options, () => adapter(options)) }
+  const services = { agents, llm, sessionController: controller,
     sessionPersistence: persistence, workspaceRegistry: { create: async (cwd: string) => ({ id: cwd }) }, permissionPresets: { set: () => {} }, subprocess, webServer,
     jobs: jobs.service, subagents: subagents.service }
-  const ctx = new Context()
-  for (const [name, service] of Object.entries(services)) ctx.reflect.provide(name, service)
+  for (const [name, service] of Object.entries({ ...services, ...options.services })) ctx.reflect.provide(name, service)
   for (const cli of [AGENT, BOT]) writeFileSync(cli, '#!/bin/sh\n', { mode: 0o755 })
   const seeded = new Store(join(directory, 'orchestrator.sqlite'))
   const sources = { github: { enabled: true, config: { repository: 'acme/widgets', cli: AGENT } }, feishu: { enabled: true, config: { cli: BOT } } }
   seeded.saveSettings(SettingsSchema.parse({ ...seeded.settings(), sources }))
   seed?.(seeded)
   seeded.close()
-  const runtime = new Runtime(ctx, testMachine({ stateDir: directory }), vi.fn())
+  const runtime = new Runtime(ctx, testMachine({ stateDir: directory, ...options.machine }), vi.fn())
   await runtime.ready
   runtime.sources.register(feishuKind); runtime.sources.register(githubKind)
   const settings = runtime.store.settings()
@@ -288,12 +525,42 @@ export async function startRuntime(seed?: (store: Store) => void) {
     await http(req, { writeHead: (code: number) => { status = code }, end: (data: string) => { text = data } })
     return { status, body: JSON.parse(text) as Record<string, unknown> }
   }
-  async function stop() { await runtime.stop(); vi.restoreAllMocks(); rmSync(directory, { recursive: true, force: true }) }
+  async function stop() { await runtime.stop(); vi.restoreAllMocks(); if (!options.stateDir) rmSync(directory, { recursive: true, force: true }) }
   /** The Session's model takes its next step, which takes the messages steered in since its last. */
   const step = (sessionId: string) => { steps.get(sessionId)!() }
   /** A step of the worker claims what waits for it, and is cut off before the Session took it. */
   const claim = (sessionId: string) => { claims.get(sessionId)!() }
-  return { runtime, ctx, directory, agents, tools, deliveries, relays, candidates, runTool, route, acceptedTicket, api, controller, subprocess, hooks, resolveDefault, stop,
-    jobs, subagents, step, claim }
+  /** The model request a loop would build for `sessionId`: its system prompt, its tool definitions and the history it took. */
+  const request = (sessionId: string, overrides: Partial<GenerateOptions> = {}): GenerateOptions => {
+    const messages: unknown[] = [{ role: 'system', content: [{ type: 'text', text: sections.get(sessionId)?.text({}) ?? '' }],
+      source: { kind: 'system-prompt' } }]
+    // The history is the Session's surface, not its log: a compaction replacement shadows the range it replaced, and a request
+    // that would still read the shadowed events could never show that recovery worked.
+    for (const event of surfaceOf(logs.get(sessionId) ?? [])) {
+      const data = (event.data ?? {}) as { message?: { content?: unknown }; content?: unknown; source?: unknown }
+      if (event.type === 'user/message') messages.push({ role: 'user', content: data.content, source: data.source })
+      else if (event.type === 'assistant/message') messages.push({ role: 'assistant', content: data.message?.content })
+      else if (event.type === 'tool/result') messages.push({ role: 'tool', content: data.message?.content })
+    }
+    return { provider: 'deepseek', model: 'deepseek-chat', messages, tools: definitionsOf(sessionId), sessionId: sessionId as never,
+      ...overrides } as GenerateOptions
+  }
+  /** Ask the model for `sessionId` as the loop does, through the `llm/stream` waterfall, and return what came back. */
+  const ask = async (sessionId: string, overrides: Partial<GenerateOptions> = {}) => {
+    const options = request(sessionId, overrides)
+    const chunks: StreamChunk[] = []
+    for await (const chunk of ctx.llm.stream(options)) chunks.push(chunk)
+    const failures = chunks.flatMap(chunk => chunk.type === 'finish' && chunk.reason.kind === 'error' ? [chunk.reason.failure] : [])
+    return { options, chunks, failures }
+  }
+  /** Dispatch a hand-built request — one that belongs to no Session, as a background job's does — through the same waterfall. */
+  const streamed = async (options: GenerateOptions) => {
+    const chunks: StreamChunk[] = []
+    for await (const chunk of ctx.llm.stream(options)) chunks.push(chunk)
+    const failures = chunks.flatMap(chunk => chunk.type === 'finish' && chunk.reason.kind === 'error' ? [chunk.reason.failure] : [])
+    return { options, chunks, failures }
+  }
+  return { runtime, ctx, directory, agents, tools, sections, logs, deliveries, relays, candidates, runTool, route, modelRoute, acceptedTicket, api, controller, subprocess,
+    hooks, resolveDefault, stop, jobs, subagents, step, claim, request, ask, streamed, asked, dsh, surfaceOf }
 }
 export type Host = Awaited<ReturnType<typeof startRuntime>>

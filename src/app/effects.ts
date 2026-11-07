@@ -6,6 +6,7 @@ export class Later extends Error {}
 /** Consecutive failures before an effect kind reports an error, matching the Sources poll failure threshold. */
 export const FAILURES_BEFORE_ERROR = 3
 import type { HealthBoard, HealthEntry } from '../infra/health.ts'
+import type { ExperienceInput } from '../memory/model.ts'
 import type { Store } from './store.ts'
 
 export interface EffectPayloads {
@@ -21,6 +22,13 @@ export interface EffectPayloads {
   notice: { value: Record<string, unknown>; summary: string }
   /** Send a message for a Channel through its Source; the key is the message ID, whose receipt the Outbox keeps. */
   reply: Record<string, never>
+  /**
+   * Record one captured experience in the long-term memory; the key is the experience ID, so a redelivery coalesces. Its payload is
+   * the largest this queue carries — one capture, with original text already clipped by `CAPTURE_MAX_CHARS` — and it is the material
+   * that waits when the memory store cannot take a commit yet. Its total cost is bounded by the capture's own admission, which
+   * measures this kind's occupancy through `occupancy` before it writes here.
+   */
+  memory: ExperienceInput
 }
 export type EffectKind = keyof EffectPayloads
 interface Handler<K extends EffectKind> {
@@ -38,10 +46,28 @@ type Options<K extends EffectKind> = Partial<Pick<Handler<K>, 'limit' | 'retry' 
 /** `seq` preserves the row's queue position; `generation` increments on payload updates so a running attempt does not delete a newer payload. */
 interface Row { key: string; value: string; seq: number; generation: number; attempts: number; due: number }
 type Task = { kind: EffectKind; key: string; done: Promise<void> }
+/**
+ * What one kind of effect holds in the durable queue: the rows waiting, the payload bytes they take, and whether one key already
+ * waits. It is read from the queue itself, so a caller that has to decide whether one more row fits measures what is really stored
+ * rather than a count it kept in memory, which a restart would lose and a second writer would not see.
+ */
+export interface QueueOccupancy {
+  readonly items: number
+  /** Bytes of the stored payloads, which is what waiting material really costs the database. */
+  readonly bytes: number
+  /** Whether the key asked about already waits, in which case one more row would replace it rather than add to the queue. */
+  readonly held: boolean
+}
+/**
+ * Told that one row of a kind is really gone, after the queue deleted it; `key` is the row's own key. It is the notification a caller
+ * acts on when it has material to offer into the place that row held, because nothing earlier is a release.
+ */
+export type ReleaseListener = (key: string) => void
 
 /**
  * Durable SQLite-backed queue that persists side effects inside command transactions and dispatches them after commit.
- * Coordinates per-kind handlers, concurrency limits, exponential backoff, and health reporting for MasterAssessor, DshExecutor, Sessions, and Outbox.
+ * Coordinates per-kind handlers, concurrency limits, exponential backoff, the release notification a caller offers waiting material
+ * into, and health reporting for MasterAssessor, DshExecutor, Sessions, and Outbox.
  */
 export class Effects {
   private readonly handlers = new Map<EffectKind, Handler<never>>()
@@ -49,6 +75,8 @@ export class Effects {
   private readonly tasks = new Set<Task>()
   /** Kinds whose last dispatch failed; the next dispatch that succeeds refreshes their health. */
   private readonly broken = new Set<EffectKind>()
+  /** Who to tell when a row of one kind is really gone, per kind: the callers that may offer material into the place it held. */
+  private readonly releases = new Map<EffectKind, Set<ReleaseListener>>()
   private seq: number
   private scheduled = false
   /** Effects run only between `start` and `drain`; rows queued before `start` wait, such as while setup is incomplete. */
@@ -74,6 +102,33 @@ export class Effects {
   }
   pending(kind: EffectKind, key?: string): boolean {
     return key === undefined ? !!this.store.db.prepare('SELECT 1 FROM effect WHERE kind = ? LIMIT 1').get(kind) : !!this.store.db.prepare('SELECT 1 FROM effect WHERE kind = ? AND key = ?').get(kind, key)
+  }
+  /**
+   * What one kind's waiting rows hold now: the rows, the payload bytes they take, and whether `key` already waits. One statement, so
+   * a caller that decides whether one more row fits reads a single consistent answer, and reads it from the queue rather than from a
+   * counter of its own — a restart changes nothing about what it reports. The bytes are the UTF-8 bytes of the stored payloads
+   * (`LENGTH(CAST(value AS BLOB))`), which is the unit admission charges a payload in; SQLite's `LENGTH` over a text value counts
+   * characters, and a ceiling stated in bytes and read that way holds three times its stated size for text that is not ASCII. The key
+   * that is asked about is bound as NULL rather than as an empty string, so a row whose key is empty is not held by a question that
+   * named no key.
+   */
+  occupancy(kind: EffectKind, key?: string): QueueOccupancy {
+    const row = this.store.db.prepare(`SELECT COUNT(*) AS items, IFNULL(SUM(LENGTH(CAST(value AS BLOB))), 0) AS bytes,
+      EXISTS(SELECT 1 FROM effect WHERE kind = ? AND key IS ?) AS held FROM effect WHERE kind = ?`).get(kind, key === undefined ? null : key, kind)
+    return { items: Number(row?.items ?? 0), bytes: Number(row?.bytes ?? 0), held: Number(row?.held ?? 0) === 1 }
+  }
+  /**
+   * Subscribe to one kind's rows being really gone, and get back the function that stops the subscription. The listener is told after
+   * `attempt` deleted the row, which is the first moment the queue position and the payload bytes the row held are free; a delivery's
+   * own return is not that moment, because the row is deleted only once the handler resolves, and a handler that fails, throws `Later`
+   * or is cut short by a shutdown keeps it queued. A caller that offers waiting material into the room a delivery is giving up must
+   * therefore act here, from the queue's own reading, rather than subtract a row it assumes is gone.
+   */
+  released(kind: EffectKind, listener: ReleaseListener): () => void {
+    const listeners = this.releases.get(kind) ?? new Set<ReleaseListener>()
+    listeners.add(listener)
+    this.releases.set(kind, listeners)
+    return () => { listeners.delete(listener) }
   }
   /** Drops a queued row by kind and key; if it is already running, that attempt finishes normally. */
   cancel(kind: EffectKind, key: string): void {
@@ -132,7 +187,11 @@ export class Effects {
     try { await handler.run(JSON.parse(row.value) as never, row.key) } catch (error) { failure = { error } }
     // Match seq and generation so a row replaced or re-queued while running is not overwritten.
     const own = 'kind = ? AND key = ? AND seq = ? AND generation = ?', ownRow = [kind, row.key, row.seq, row.generation] as const
-    if (!failure) this.store.db.prepare(`DELETE FROM effect WHERE ${own}`).run(...ownRow)
+    if (!failure) {
+      // The row is gone at this statement and not before it: what the attempt freed is what a listener may offer other material into.
+      const gone = this.store.db.prepare(`DELETE FROM effect WHERE ${own}`).run(...ownRow).changes > 0
+      if (gone) this.release(kind, row.key)
+    }
     // Leave running rows untouched on shutdown so they retry on the next start.
     else if (this.stopped) return
     else if (failure.error instanceof Later) {
@@ -143,6 +202,12 @@ export class Effects {
         .run(String(failure.error).slice(0, 1000), this.now() + delay, ...ownRow)
     }
     if (!this.stopped) this.report(kind)
+  }
+  /** Tells one kind's subscribers that `key` really left the queue; a subscriber's failure is reported, never allowed to disturb the queue. */
+  private release(kind: EffectKind, key: string): void {
+    for (const listener of this.releases.get(kind) ?? []) {
+      try { listener(key) } catch (error) { this.failed(kind, error) }
+    }
   }
   private failed(kind: EffectKind, error: unknown): void {
     this.broken.add(kind)

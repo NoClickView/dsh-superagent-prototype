@@ -434,7 +434,8 @@ it('tells the main Session of the settings, prompts, requeues and unsubscription
   expect(await h.runTool(h.runtime.masterId, 'orchestrator_trigger_requeue', { trigger_id: thanks.id })).toEqual({ queued: true })
   expect(await h.runTool(h.runtime.masterId, 'orchestrator_thread_unsubscribe', { thread: `feishu:${CHAT}:om_1` })).toEqual({ removed: true, thread: `feishu:${CHAT}:om_1` })
   await h.runtime.idle()
-  expect(notices().slice(before).filter(notice => !('ticket_ended' in notice))).toEqual([])
+  // Recalled memory is a separate kind of injected context, which this test does not cover: this one is about notices of actions.
+  expect(notices().slice(before).filter(notice => !('ticket_ended' in notice) && notice.kind !== 'memory')).toEqual([])
 })
 
 it('answers a policy sync with the counts and what changed, not the whole list', async () => {

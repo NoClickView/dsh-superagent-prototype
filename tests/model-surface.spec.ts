@@ -23,6 +23,7 @@ import { SettingsSchema } from '../src/policy.ts'
 import { feishuKind, feishuTrigger } from '../src/sources/feishu.ts'
 import { githubKind } from '../src/sources/github.ts'
 import { testMachine } from './fixtures/deployment.ts'
+import { fakeSession } from './fixtures/host.ts'
 
 type Role = 'orchestrator' | 'worker'
 interface Surface { where: string; owner: string; role: Role | 'both'; text: string }
@@ -123,7 +124,7 @@ async function start() {
     const deliver = (queue: UserMessage[]) => (message: UserMessage) => {
       queue.push(message); record(message); agents.get(sessionId)!.status = 'running'
     }
-    const session = { id: sessionId, snapshotEvents: () => [], requestHeader: () => undefined, append: () => {} }
+    const session = fakeSession(sessionId, () => [])
     agents.set(sessionId, { id: sessionId, ctx: agentCtx, inbox, followup: deliver(inbox.nextTurn), steer: deliver(inbox.nextStep),
       inject: record, status: 'idle', cancel: () => {}, whenIdle: async () => {}, session } as never)
   }
@@ -326,7 +327,7 @@ function failures(): Map<string, string> {
       if (word!.split('/').some(part => REPORT_WORDS.test(part)) && !(TICKET_STATES as readonly string[]).includes(word!)) fail(`"${phrase}" is not a card state`)
     }
     for (const [phrase] of text.matchAll(/\bwait(?:ing)? for (?:ready|waiting|blocked|failed)\b(?! report)/g)) fail(`"${phrase}" names a report state without report`)
-    for (const [found] of text.matchAll(/\b(?:ticket|trigger|decision|prompts|prompt-preview|models|feishu|github)\/[^\s"'`,;)\]]*/g)) {
+    for (const [found] of text.matchAll(/\b(?:ticket|trigger|decision|prompts|prompt-preview|models|feishu|github|memory)\/[^\s"'`,;)\]]*/g)) {
       const name = found.replace(/[.:]+$/, '')
       if (!RESOURCE_NAMES.some(pattern => pattern.test(name))) fail(`${name} is not a resource orchestrator_read reads`)
     }

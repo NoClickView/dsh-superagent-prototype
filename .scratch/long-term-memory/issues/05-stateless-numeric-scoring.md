@@ -4,17 +4,37 @@
 
 **Blocked by:** 02 — 经历写入后可跨重启召回
 
-**Status:** ready-for-agent
-
+**Status:** resolved
 **Spec:** [长期记忆规格](https://github.com/NoClickView/dsh-superagent-prototype/blob/f5b6a3270f390a8068413fdb61f6d2757c020a30/.scratch/long-term-memory/spec.md)
 
-- [ ] 从事件进入、调度独立评分、验证结果、提交权重到下一次召回排序形成完整路径；后台模型经统一输入预算入口调用。
-- [ ] 每次输入仅含版本化原则、本次任务及有界证据；录制请求证明不存在前次会话、评估器私有记忆或隐式历史推理。
-- [ ] 后台模型只输出连续数值、依据、证据引用与不确定项，不自行访问工具或改写文件；原则与材料明确分离。
-- [ ] 程序计算规则与语义分数的线性组合，验证尺度、系数、边界及数值合法性，不能以低/中/高取代权威分数。
-- [ ] 重要性、相关性、可信度和当前有效性各自保存或计算；重复检索、模型自述或同源复述不能提高证据可信度。
-- [ ] 无效、缺失引用、过期版本或重复作业结果不产生错误提交；失败时保留已有有效结果或明确的规则暂定值。
-- [ ] 记录输入、规则、原则、模型及提交版本；支持一次显式重评并按版本去重，不自动无限重试。
-- [ ] Runtime 集成测试使用可控模型响应验证干净请求、数值结果、排序变化和故障行为，不要求真实模型严格确定。
+- [x] 从事件进入、调度独立评分、验证结果、提交权重到下一次召回排序形成完整路径；后台模型经统一输入预算入口调用。
+- [x] 每次输入仅含版本化原则、本次任务及有界证据；录制请求证明不存在前次会话、评估器私有记忆或隐式历史推理。
+- [x] 后台模型只输出连续数值、依据、证据引用与不确定项，不自行访问工具或改写文件；原则与材料明确分离。
+- [x] 程序计算规则与语义分数的线性组合，验证尺度、系数、边界及数值合法性，不能以低/中/高取代权威分数。
+- [x] 重要性、相关性、可信度和当前有效性各自保存或计算；重复检索、模型自述或同源复述不能提高证据可信度。
+- [x] 无效、缺失引用、过期版本或重复作业结果不产生错误提交；失败时保留已有有效结果或明确的规则暂定值。
+- [x] 记录输入、规则、原则、模型及提交版本；支持一次显式重评并按版本去重，不自动无限重试。
+- [x] Runtime 集成测试使用可控模型响应验证干净请求、数值结果、排序变化和故障行为，不要求真实模型严格确定。
 
+## Answer
 
+Resolved on `integration/long-term-memory` (ticket merge `5932d49`; `confidence` added in the review round).
+
+**The clean background call.** `src/memory/background.ts` builds one `GenerateOptions` by hand — versioned principles,
+this job, a bounded evidence pack — and calls `ctx.llm.stream`, with no Session, no history and no previous answer. It
+routes through the same `llm/stream` waterfall ticket 01 meters, so a background call is budgeted like a foreground one. A
+recorded-request test proves the request carries only those parts and that instructional text inside the material changes
+neither the principles nor the budget. Job input, rules, principles version, model and the committed version are recorded
+with the weight.
+
+**The numbers.** Scale 0–100; `importance = clamp(0.6·rule + 0.4·semantic, 0, 100)`; deterministic rule terms from the kind
+of fact and its origin (25–91); one time term applied once. Thresholds detail 70 / summary 40 / forgotten 15,
+`inclusive: true`; reactivation correlation 0.34. Every constant and its basis is in the calibration section of
+`docs/007`; the replay found the time term wrong and it was recalibrated to 1/3650 (policy `mem-policy-4`).
+
+**Four separate quantities.** `importance` is stored; correlation is computed per query and never written back;
+`confidence` is stored and computed from the evidence only (kind plus independent corroboration — it does not move on a
+read, a model's restatement, or a second report from the same Source); validity comes from ticket 08's revision state.
+Rejected, malformed, mis-cited, off-scale or stale candidates write nothing.
+
+**Evidence.** `tests/memory-score.spec.ts`, `tests/memory-scoring.spec.ts`, `tests/memory-confidence.spec.ts`.

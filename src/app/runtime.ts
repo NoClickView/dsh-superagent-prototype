@@ -28,6 +28,11 @@ import { Store } from './store.ts'
 import { evalsHealth } from './views/overview.ts'
 import { TextCache } from './cache.ts'
 import { Effects } from './effects.ts'
+import { createMemory, backgroundLimits, type Memory } from './memory.ts'
+import { BackgroundJobs, importanceKind } from '../memory/background.ts'
+import { MEMORY_POLICY } from '../memory/score.ts'
+import { compressionKind } from '../memory/summary.ts'
+import { measureVisible, NO_PARTS, RequestBudget, type RequestParts } from './budget.ts'
 import { Prompts } from './prompts.ts'
 import { registerHttp, type HttpHost } from './http.ts'
 import type { LinkTarget } from './views/records.ts'
@@ -60,6 +65,7 @@ export class Runtime extends Service implements SourceHost {
   readonly store: Store
   readonly setup: Setup
   readonly prompts: Prompts
+  readonly budget: RequestBudget
   readonly effects: Effects
   readonly sources: SourceRegistry
   readonly commands: Commands
@@ -70,6 +76,8 @@ export class Runtime extends Service implements SourceHost {
   readonly outbox: Outbox
   readonly engine: Engine
   readonly passes: Passes
+  /** The long-term memory: capture, recall, and the read resource's source of published versions. */
+  readonly memory: Memory
   readonly ready: Promise<void>
   private readonly board = new HealthBoard()
   private readonly runtimeHealth = this.board.claim('runtime', { state: 'starting', detail: '' })
@@ -101,11 +109,52 @@ export class Runtime extends Service implements SourceHost {
         ? environmentOf({ deployment: setup.deployment, sources: this.sources, settings: store.settings() }) : undefined
       const feishu = () => setup.configured() && !!setup.deployment.feishu
       const prompts = this.prompts = new Prompts(store, () => machine.promptMaxChars.get(), deployed, feishu)
+      // One budget policy for every model request the runtime causes, read on each use so a changed setting applies at once;
+      // background memory work will measure its own requests with it too.
+      const budget = this.budget = new RequestBudget(() => ({ maxInputChars: machine.requestMaxChars.get(),
+        outputReserveChars: machine.requestOutputReserveChars.get(), measurementReserveChars: machine.requestMeasurementReserveChars.get() }))
       const masterId = this.masterId = store.get(KV.runtime.masterId) ?? `orchestrator-${key(machine.stateDir)}`
       store.set(KV.runtime.masterId, masterId)
       const commands = this.commands = new Commands(() => setup.deployment, setup.commandEnvironment, this.lifetime)
       const board = this.board
       const effects = this.effects = new Effects(store, board)
+      /**
+       * The model a stateless background call is made with: the assessment model when one is configured, otherwise the deployment's
+       * own default from the model catalog. A deployment that configures neither makes no background call rather than guessing a
+       * provider, and the job says so in its own record.
+       */
+      const backgroundModel = async (): Promise<{ provider: string; model: string } | undefined> => {
+        const configured = store.settings().eval.model
+        if (configured) return { provider: configured.provider, model: configured.model }
+        try {
+          const fallback = await ctx.sessionController.modelCatalog?.()
+          const selected = fallback?.default
+          return selected === undefined ? undefined : { provider: selected.provider, model: selected.model }
+        } catch { return undefined }
+      }
+      // Long-term memory: opened synchronously here so recall works from the first assembly, and so a broken store degrades to reads
+      // only instead of stopping the runtime. Capture enqueues the durable `memory` effect from inside the Engine's transaction, and
+      // the recall allowance is the budget's own: what one Session's next request leaves, less what the model will actually see of
+      // that Session (`measureVisible` — the surface after every committed compaction replacement, not the log it superseded). The
+      // background evaluator is built around the same service, and its one model call goes through `ctx.llm.stream` so the request
+      // budget measures it beside every Session request.
+      const memory = this.memory = createMemory({ machine, effects, records: store, position: store, masterId,
+        room: id => Math.min(this.sessions.allowance(id), budget.room(this.visibleMaterial(id), id)),
+        health: board.claim('memory-store'), backgroundHealth: board.claim('memory-background'),
+        project: () => setup.configured() ? setup.deployment.repository : undefined,
+        deliver: (requestId, text) => this.sessions.prompt(this.masterId, requestId, text, 'recall'),
+        evaluate: (service, report) => {
+          const jobs = new BackgroundJobs({ service, stream: options => ctx.llm.stream(options), model: backgroundModel,
+            limits: () => backgroundLimits(machine), report, now })
+          jobs.register(importanceKind(service, MEMORY_POLICY, now))
+          jobs.register(compressionKind(service, now))
+          return { score: id => jobs.request('importance', id), compress: id => jobs.request('compression', id),
+            reevaluate: id => jobs.reevaluate('importance', id), condense: id => jobs.reevaluate('compression', id),
+            retry: id => jobs.retry(id), pause: () => jobs.pause(), resume: () => jobs.resume(), wake: () => jobs.wake(),
+            stop: () => jobs.stop(),
+            whenIdle: () => jobs.whenIdle(), jobs: () => jobs.jobs(), backlog: () => jobs.backlog(), sweep: () => jobs.sweep() }
+        } })
+      effects.handle('memory', (input, key) => memory.store(input, key), { limit: () => 1 })
       const sources = this.sources = new SourceRegistry(() => store.settings(), board, kind => {
         // Sync source member lists once startup completes when a source plugin loads dynamically.
         if (kind.policy?.sync) void this.ready?.then(() => this.settings.syncable().includes(kind.kind) ? this.settings.sync(kind.kind) : undefined)
@@ -115,11 +164,12 @@ export class Runtime extends Service implements SourceHost {
       const links: LinkHost = { store, links: this.sourceLinks, commands, sources, lifetime: this.lifetime }
       const link = (trigger: Trigger, signal?: AbortSignal) => sourceLink(links, trigger, signal)
       const environment = (ticket: Ticket) => this.ticketEnvironment(ticket)
-      const resources: ResourceHost = { store, pages: new TextCache(4_000_000), prompts, commands, masterId, context: ctx,
+      const resources: ResourceHost = { store, pages: new TextCache(4_000_000), prompts, commands, masterId, context: ctx, memory,
         promptVersion: id => this.sessions.promptVersion(id), mayRead: (id, revision) => this.sessions.mayRead(id, revision),
         feishuPageSize: () => feishuSettings(sources).readPageSize, sourceLink: link }
-      const sessions = this.sessions = new Sessions({ context: ctx, store, prompts, effects, health: board.claim('models'), masterId,
-        lifetime: this.lifetime,
+      const sessions = this.sessions = new Sessions({ context: ctx, store, prompts, effects, budget, health: board.claim('models'),
+        budgetHealth: board.claim('budget', { state: 'ready', detail: 'No model request has been measured yet' }),
+        masterId, lifetime: this.lifetime,
         closing: () => this.closing(), environment,
         tools: (agent, ticket) => ticket ? executorTools(this.toolHost, ticket) : mainTools(this.toolHost, agent) })
       const policyChanged: EngineForSettings['policyChanged'] = (from, to, effects) => { this.engine.policyChanged(from, to, effects) }
@@ -136,6 +186,8 @@ export class Runtime extends Service implements SourceHost {
       const policy = () => settingsPolicy(store.settings(), sources)
       const engine = this.engine = new Engine({ repo: store, scope: sources, policy, assessor, executor,
         outbox, prepareTicket: (ticket, outcome) => executor.prepare(ticket, outcome), emit: event => {
+          // Durable memory capture first: the queue row commits inside this transaction, so a crash cannot lose the experience.
+          memory.capture(event)
           // Notify the main Session only about domain events it did not initiate itself.
           const notice = this.quiet ? undefined : eventNotice(event, id => store.tickets.get(id))
           if (notice) sessions.notify(...notice)
@@ -191,6 +243,25 @@ export class Runtime extends Service implements SourceHost {
     return ticketEnvironment({ deployment, sources, settings: this.store.settings(), ticket, ...trigger ? { trigger } : {} })
   }
   checkSetup(): void { this.setup.check() }
+  /**
+   * Measure the boundary the long-term memory's single writer needs, admit or refuse its writes, and record what was found: the health
+   * entry can only say what a shell could reach, so the conditions themselves go to the log where an operator can read them.
+   */
+  private async checkMemoryBoundary(): Promise<void> {
+    const isolation = await this.setup.isolation(this.ctx.agents.get(this.masterId as SessionId)?.session, this.store.settings())
+    this.memory.admit(isolation)
+    const found = [isolation.detail, ...isolation.observed.map(fact => `${fact.name}: ${fact.detail}`)].join(' | ')
+    if (isolation.proven) this.ctx.logger.info('dsh-superagent memory boundary: %s', found)
+    else this.ctx.logger.warn('dsh-superagent memory boundary: %s', found)
+  }
+  /**
+   * What the model will actually see of one Session's next request, which recalled material is measured against before it may be
+   * added: DSH's derived history, so a range a compaction replaced is gone rather than counted a second time.
+   */
+  private visibleMaterial(sessionId: string): RequestParts {
+    const session = this.ctx.agents.get(sessionId as SessionId)?.session
+    return session === undefined ? NO_PARTS : measureVisible(session)
+  }
   receive(trigger: Trigger): ReceiveResult { return this.passes.receive(trigger) }
   idle(): Promise<void> { return this.passes.idle() }
   pump(): Promise<void> { return this.passes.pump() }
@@ -208,9 +279,17 @@ export class Runtime extends Service implements SourceHost {
     this.sessions.install()
     this.executor.install()
     await this.sessions.ensure(this.masterId, this.machine.stateDir, 'dsh-superagent orchestrator', 'orchestrator')
+    // The long-term memory's single writer needs a boundary DeepSeek Harness can point at, and the preset these Sessions run under is
+    // part of what makes one. The check runs here, once setup resolved the world the agent runs in, and a deployment that proves none
+    // refuses the memory's writes with the reason on the `memory-store` health entry rather than claiming a single writer it lacks.
+    await this.checkMemoryBoundary()
     for (const id of this.settings.syncable()) await this.settings.sync(id).catch(() => { /* sync() records its failure in health. */ })
     // If stop() was called while awaiting setup, session creation, or policy sync, do not start background loops.
     if (this.closing()) return
+    // What a principle or model change left computed under older versions is re-evaluated in bounded pages from here on, so an upgrade
+    // catches up without an operator: the sweep reads the published version, plans only the records whose own audit names older
+    // versions, and holds itself to the same bounds every other pass does.
+    void this.memory.sweep().catch(() => { /* The backlog's own records say what failed. */ })
     this.executor.resume()
     this.passes.start()
     this.effects.start()
@@ -239,6 +318,9 @@ export class Runtime extends Service implements SourceHost {
       await this.executor.shutdown()
       this.executor.dispose()
       this.sessions.dispose()
+      // The background memory work stops before its files close: the pass in flight is waited for, so what it already earned commits
+      // and nothing reaches the store after this returns.
+      await this.memory.close()
       for (const dispose of this.disposers.reverse()) dispose()
       await this.ctx.sessionPersistence.flush()
     } finally {

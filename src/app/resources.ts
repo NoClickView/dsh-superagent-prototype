@@ -13,6 +13,7 @@ import { transcriptEntry } from './context.ts'
 import { builtInParts, defaultPrompts } from './prompts.ts'
 import type { Context } from '@deepseek-ai/cordis'
 import type { Commands } from '../infra/commands.ts'
+import type { Memory } from './memory.ts'
 import type { PromptVersion, Prompts } from './prompts.ts'
 import type { Sessions } from './sessions.ts'
 import type { Settings } from './settings.ts'
@@ -50,6 +51,8 @@ export const RESOURCES: readonly { name: string; holds: string; executor?: true 
   { name: 'prompt-preview/<id>', holds: 'a composed prompt that orchestrator_prompts_save previewed' },
   { name: 'models', holds: 'model providers, the DSH default and each role\'s model' },
   { name: 'models/<provider>', holds: 'one provider\'s models' },
+  { name: 'memory', holds: 'long-term experiences in scope, newest first, each one line', executor: true },
+  { name: 'memory/<id>', holds: 'one experience\'s original text with its summary and sources, or how much is no longer stored', executor: true },
   { name: 'feishu/<trigger-id>/…', holds: 'a Feishu original, as the dsh-superagent-feishu skill describes', executor: true },
   { name: 'github/…', holds: 'a GitHub original, as the dsh-superagent-github skill describes', executor: true },
 ]
@@ -60,6 +63,8 @@ export interface ResourceHost {
   readonly store: Pick<Store, 'get' | 'settings' | 'triggers' | 'tickets' | 'threads' | 'read' | 'decisions' | 'replyStatus'>
   readonly pages: TextCache
   readonly prompts: Pick<Prompts, 'current' | 'version' | 'history' | 'skills' | 'defaultChanged'>
+  /** The published long-term memory, filtered to the scope of the Session that reads. */
+  readonly memory: Pick<Memory, 'list' | 'expand'>
   readonly commands: Commands
   readonly masterId: string
   readonly context: Context
@@ -198,6 +203,28 @@ const ROUTES: readonly Route[] = [
     const models = (await main(read).context.sessionController.modelCatalog()).groups.find(group => group.id === read.rest)?.models
     if (!models) throw new Error('Unknown model provider')
     return list(read, (offset, count) => models.slice(offset, offset + count))
+  }],
+  ['memory', read => {
+    // The scope is the reader's own: its project, and a worker Session's ticket. The page and the version are what it may then read.
+    const page = read.host.memory.list(read.ticketId, read.offset, Math.min(read.limit ?? 20, 50))
+    // Every line says where the claim stands: `at` is when it happened, `since` when it became the understanding, and `ended` the
+    // instant a later claim replaced it — so the current understanding and what it replaced are never read as the same thing.
+    return { version: page.version, total: page.total, next_offset: page.next ?? null, items: page.items.map(item => ({
+      id: item.id, at: item.at, source: item.source, kind: item.kind, preview: item.preview, chars: item.chars, revision: item.revision,
+      state: item.state, since: item.validFrom, ...(item.validTo === undefined ? {} : { ended: item.validTo }),
+      ...(item.by === undefined ? {} : { by: item.by }), readable: item.readable,
+      ...(item.summary === undefined ? {} : { summary: item.summary }), read: `memory/${item.id}` })) }
+  }],
+  ['memory/', read => {
+    const expanded = read.host.memory.expand(read.ticketId, read.rest, 8000)
+    if (expanded.status === 'unknown') throw new Error('Unknown experience')
+    // An evicted original is never dressed up as a summary: the caller is told the detail is no longer stored, and what is left of it.
+    if (expanded.status === 'evicted') throw new Error(expanded.summary === undefined
+      ? 'The original text of this experience is no longer stored, and no summary of it was kept'
+      : `The original text of this experience is no longer stored; what remains is the summary of ${expanded.summary.version}: ${expanded.summary.text}`)
+    // The gist travels with the original it was written from, so a reader can check one against the other instead of trusting it.
+    return { ...text(read, expanded.text), ...(expanded.summary === undefined ? {} : { summary: { version: expanded.summary.version,
+      job: expanded.summary.jobId, at: expanded.summary.at, sources: [...expanded.summary.sourceMap] } }) }
   }],
   ['feishu/', async read => {
     const source = trigger(read.host, read.rest.split('/')[0]!, read.ticketId)

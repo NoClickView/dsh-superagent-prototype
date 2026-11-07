@@ -1,5 +1,6 @@
 /** Plugin configuration and startup verification for repository access and agent CLI identities. */
 import { LIMITS } from './limits.ts'
+import type { MemoryWriteMode } from './limits.ts'
 import { accessSync, constants, statSync } from 'node:fs'
 import { delimiter, isAbsolute, join } from 'node:path'
 import type { Volatile } from '@deepseek-ai/cordis'
@@ -20,6 +21,54 @@ export const Config = s.object({
     .description('Pages of thread context one assessment may read.').volatile(),
   admissionContextTimeoutMs: s.number().min(LIMITS.admissionContextTimeoutMs.min).max(LIMITS.admissionContextTimeoutMs.max).step(1)
     .default(15000).description('Time limit of one context read during an assessment, in milliseconds.').volatile(),
+  requestMaxChars: s.number().min(LIMITS.requestMaxChars.min).max(LIMITS.requestMaxChars.max).step(1).default(400000)
+    .description('Largest model request dsh-superagent lets through, in characters, counting its system prompt, tool definitions, conversation, tool results and recalled material.').volatile(),
+  requestOutputReserveChars: s.number().min(LIMITS.requestReserveChars.min).max(LIMITS.requestReserveChars.max).step(1).default(32000)
+    .description('Characters of requestMaxChars kept free for the model\'s answer.').volatile(),
+  requestMeasurementReserveChars: s.number().min(LIMITS.requestReserveChars.min).max(LIMITS.requestReserveChars.max).step(1).default(8000)
+    .description('Characters of requestMaxChars kept free for the measurement of a request.').volatile(),
+  memoryBudgetBytes: s.number().min(LIMITS.memoryBudgetBytes.min).max(LIMITS.memoryBudgetBytes.max).step(1).default(67_108_864)
+    .description('Total bytes the memory files under the state directory may use; a full store back-pressures rather than growing.')
+    .volatile(),
+  memoryRecallMaxChars: s.number().min(LIMITS.memoryRecallMaxChars.min).max(LIMITS.memoryRecallMaxChars.max).step(1).default(4000)
+    .description('Largest recalled-memory notice one model request may carry, in characters, within that request\'s own budget.')
+    .volatile(),
+  memoryRecallWakes: s.number().min(LIMITS.memoryRecallWakes.min).max(LIMITS.memoryRecallWakes.max).step(1).default(8)
+    .description('Reactivation notices one Session may receive in one recall window. It is the bound on how often a strong cue may '
+      + 'interrupt a request, and it is not a lifetime quota: a notice stops counting one window after it landed.').volatile(),
+  memoryRecallWindowMs: s.number().min(LIMITS.memoryRecallWindowMs.min).max(LIMITS.memoryRecallWindowMs.max).step(1).default(1_800_000)
+    .description('How long one reactivation notice keeps counting, in milliseconds. A strong cue keeps waking old experiences inside '
+      + 'this window and the allowance comes back as it passes, so neither a restart nor the agent has to give it back.').volatile(),
+  memoryPendingMaxItems: s.number().min(LIMITS.memoryPendingMaxItems.min).max(LIMITS.memoryPendingMaxItems.max).step(1).default(256)
+    .description('Captures that may wait in the durable queue for the long-term memory store to accept them. Their payloads may take '
+      + 'as many bytes as memoryBudgetBytes, so the two settings are one finite capacity: once the queue holds what it may, the '
+      + 'receiving boundary refuses further captures and reports them instead of storing material the store may never take.').volatile(),
+  memoryRedeliveryMaxItems: s.number().min(LIMITS.memoryRedeliveryMaxItems.min).max(LIMITS.memoryRedeliveryMaxItems.max).step(1)
+    .default(64).description('Captures the receiving boundary refused that may wait at the redelivery position, to be offered again '
+      + 'one at a time once the queue has room. Their payloads may take as many bytes as memoryBudgetBytes, the same share the queue '
+      + 'takes, and the oldest are evicted past either bound and counted as permanently lost rather than dropped in silence.')
+    .volatile(),
+  memoryWriteMode: s.union(LIMITS.memoryWriteMode.map(value => s.const(value))).default('require')
+    .description('Whether long-term memory writes need a boundary that keeps an agent shell out of the memory files: `require` refuses '
+      + 'every write when the deployment proves none, `waive` writes anyway and says so on the memory health entry.').volatile(),
+  memoryBackgroundMaxCalls: s.number().min(LIMITS.memoryBackgroundMaxCalls.min).max(LIMITS.memoryBackgroundMaxCalls.max).step(1).default(8)
+    .description('Model calls the long-term memory\'s background work may make in one pass before it yields to the foreground.')
+    .volatile(),
+  memoryBackgroundBatch: s.number().min(LIMITS.memoryBackgroundBatch.min).max(LIMITS.memoryBackgroundBatch.max).step(1).default(8)
+    .description('Jobs one background pass takes from its queue in total, whatever calls it could still spend, and records one '
+      + 're-evaluation sweep reads, at a time.').volatile(),
+  memoryBackgroundConcurrency: s.number().min(LIMITS.memoryBackgroundConcurrency.min).max(LIMITS.memoryBackgroundConcurrency.max).step(1)
+    .default(1).description('Background jobs one pass may run at once. One keeps every commit in the order the versions it read were '
+      + 'published, which is why it is the default; more buys throughput and pays for it in results refused as stale.').volatile(),
+  memoryBackgroundPending: s.number().min(LIMITS.memoryBackgroundPending.min).max(LIMITS.memoryBackgroundPending.max).step(1).default(256)
+    .description('Background jobs that may wait for a model call. A plan beyond it is deferred and reported, never queued without end.')
+    .volatile(),
+  memoryBackgroundTimeoutMs: s.number().min(LIMITS.memoryBackgroundTimeoutMs.min).max(LIMITS.memoryBackgroundTimeoutMs.max).step(1)
+    .default(60_000).description('Wall clock of one background model call before it is abandoned and recorded as a failure, in '
+      + 'milliseconds; the foreground never waits on it.').volatile(),
+  memoryBackgroundAttempts: s.number().min(LIMITS.memoryBackgroundAttempts.min).max(LIMITS.memoryBackgroundAttempts.max).step(1).default(2)
+    .description('Attempts one experience\'s job of a kind may be given, across passes and restarts, before the background leaves it alone.')
+    .volatile(),
 })
 export type DeploymentConfig = ReturnType<typeof Config>
 export interface Machine {
@@ -27,6 +76,22 @@ export interface Machine {
   promptMaxChars: Volatile<number>
   admissionContextMaxPages: Volatile<number>
   admissionContextTimeoutMs: Volatile<number>
+  requestMaxChars: Volatile<number>
+  requestOutputReserveChars: Volatile<number>
+  requestMeasurementReserveChars: Volatile<number>
+  memoryBudgetBytes: Volatile<number>
+  memoryRecallMaxChars: Volatile<number>
+  memoryRecallWakes: Volatile<number>
+  memoryRecallWindowMs: Volatile<number>
+  memoryPendingMaxItems: Volatile<number>
+  memoryRedeliveryMaxItems: Volatile<number>
+  memoryWriteMode: Volatile<MemoryWriteMode>
+  memoryBackgroundMaxCalls: Volatile<number>
+  memoryBackgroundBatch: Volatile<number>
+  memoryBackgroundConcurrency: Volatile<number>
+  memoryBackgroundPending: Volatile<number>
+  memoryBackgroundTimeoutMs: Volatile<number>
+  memoryBackgroundAttempts: Volatile<number>
 }
 const MOVED: Record<string, string> = {
   repository: 'on the GitHub Source', branchPrefix: 'in the prepare command of the Execution settings', github: 'on the GitHub Source',
@@ -38,8 +103,20 @@ const MOVED: Record<string, string> = {
 export function machineOf(config: DeploymentConfig): Machine {
   const unknown = Object.keys(config).filter(key => !(key in (Config.dict ?? {})))
   if (unknown.length) throw new Error(`dsh-superagent configuration has keys it does not use: ${unknown.map(key => MOVED[key] ? `${key} (now ${MOVED[key]})` : key).join(', ')}; docs/006-deployment.md lists the keys`)
-  const { stateDir, promptMaxChars, admissionContextMaxPages, admissionContextTimeoutMs } = config
-  return { stateDir, promptMaxChars, admissionContextMaxPages, admissionContextTimeoutMs }
+  const { stateDir, promptMaxChars, admissionContextMaxPages, admissionContextTimeoutMs, requestMaxChars, requestOutputReserveChars,
+    requestMeasurementReserveChars, memoryBudgetBytes, memoryRecallMaxChars, memoryRecallWakes, memoryRecallWindowMs, memoryPendingMaxItems,
+    memoryRedeliveryMaxItems, memoryWriteMode, memoryBackgroundMaxCalls, memoryBackgroundBatch, memoryBackgroundConcurrency,
+    memoryBackgroundPending, memoryBackgroundTimeoutMs, memoryBackgroundAttempts } = config
+  // A budget whose reserves take all of it admits no request at all, which is a configuration error, not a runtime state.
+  const reserved = requestOutputReserveChars.get() + requestMeasurementReserveChars.get()
+  if (reserved >= requestMaxChars.get()) {
+    throw new Error(`dsh-superagent reserves ${reserved} characters of a ${requestMaxChars.get()}-character model request: `
+      + 'requestOutputReserveChars and requestMeasurementReserveChars must total less than requestMaxChars')
+  }
+  return { stateDir, promptMaxChars, admissionContextMaxPages, admissionContextTimeoutMs, requestMaxChars, requestOutputReserveChars,
+    requestMeasurementReserveChars, memoryBudgetBytes, memoryRecallMaxChars, memoryRecallWakes, memoryRecallWindowMs, memoryPendingMaxItems,
+    memoryRedeliveryMaxItems, memoryWriteMode, memoryBackgroundMaxCalls, memoryBackgroundBatch, memoryBackgroundConcurrency,
+    memoryBackgroundPending, memoryBackgroundTimeoutMs, memoryBackgroundAttempts }
 }
 
 export const GithubAccountsSchema = z.object({

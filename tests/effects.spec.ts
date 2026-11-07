@@ -7,6 +7,7 @@ import { Effects, Later } from '../src/app/effects.ts'
 import { Store } from '../src/app/store.ts'
 import { HealthBoard } from '../src/infra/health.ts'
 import { deferred } from './fixtures/async.ts'
+import { memoryInput } from './fixtures/memory.ts'
 
 let directory: string
 let store: Store
@@ -204,4 +205,76 @@ it('reports a failure of the queue itself under its kind, until a dispatch of th
 it('refuses a second handler for a kind', () => {
   effects.handle('relay', async () => {})
   expect(() => effects.handle('relay', async () => {})).toThrow('The relay effects already have a handler')
+})
+
+it('reports what one kind holds and which key already waits, read from the queue rather than counted', () => {
+  effects.handle('relay', async () => {})
+  effects.handle('memory', async () => {})
+  expect(effects.occupancy('relay')).toEqual({ items: 0, bytes: 0, held: false })
+  effects.enqueue('relay', 'a', relay('12345'))
+  effects.enqueue('relay', 'b', relay('1234567'))
+  const bytes = (value: unknown): number => Buffer.byteLength(JSON.stringify(value), 'utf8')
+  // The bytes are the payloads the queue stores, and the key asked about is answered by the queue itself rather than by a count this
+  // process keeps, so what a caller bounds is what is really persisted.
+  expect(effects.occupancy('relay')).toEqual({ items: 2, bytes: bytes(relay('12345')) + bytes(relay('1234567')), held: false })
+  expect(effects.occupancy('relay', 'b')).toMatchObject({ items: 2, held: true })
+  expect(effects.occupancy('relay', 'c')).toMatchObject({ items: 2, held: false })
+  // One kind is measured alone: what another kind waits with is not this kind's cost.
+  effects.enqueue('memory', 'a', memoryInput())
+  expect(effects.occupancy('relay')).toMatchObject({ items: 2 })
+  expect(effects.occupancy('memory')).toEqual({ items: 1, bytes: bytes(memoryInput()), held: false })
+  expect(effects.occupancy('memory', 'a')).toEqual({ items: 1, bytes: bytes(memoryInput()), held: true })
+  // What is counted is the bytes stored, not the characters they are written in: 100 CJK characters are 300 bytes, and a ceiling
+  // stated in bytes has to be read in the unit the queue really occupies.
+  const wide = relay('错误'.repeat(50))
+  effects.enqueue('relay', 'c', wide)
+  expect(effects.occupancy('relay')).toEqual({ items: 3, bytes: bytes(relay('12345')) + bytes(relay('1234567')) + bytes(wide), held: false })
+})
+
+it('tells a listener each row the queue really finished, after the delete, so the place it held is free when it is told', async () => {
+  effects.handle('memory', async () => {})
+  // What the listener reads when it is told: a caller that offers waiting material into the place a delivery is giving up has to see
+  // that place already gone from the queue, which only the delete makes true — a handler's own return is not yet a release.
+  const seen: number[] = []
+  const stop = effects.released('memory', () => { seen.push(effects.occupancy('memory').items) })
+  effects.enqueue('memory', 'first', memoryInput())
+  await effects.idle()
+  expect(seen).toEqual([0])
+  expect(effects.pending('memory')).toBe(false)
+  // A listener that stopped listening hears nothing of the next release, and the queue is unaffected either way.
+  stop()
+  effects.enqueue('memory', 'second', memoryInput({ primary: 'feishu:oc_team:second' }))
+  await effects.idle()
+  expect(seen).toEqual([0])
+  expect(effects.pending('memory')).toBe(false)
+})
+
+it('tells no listener a row was released while it is still queued: a failure, a Later and a shutdown all keep it', async () => {
+  const released = vi.fn()
+  effects.released('memory', released)
+  let holding: 'failure' | 'later' = 'failure'
+  effects.handle('memory', async () => { if (holding === 'later') throw new Later(); throw new Error('the store is full') },
+    { retry: [1000, 1000] })
+  effects.enqueue('memory', 'kept', memoryInput())
+  await effects.idle()
+  // The attempt failed, so `attempt` keeps the row for the retry it scheduled: its place is not free, and nothing may be offered into it.
+  expect(released).not.toHaveBeenCalled()
+  expect(effects.pending('memory', 'kept')).toBe(true)
+  holding = 'later'
+  clock += 1000; await effects.idle()
+  // A `Later` reschedules the same row rather than deleting it, which is not a release either.
+  expect(released).not.toHaveBeenCalled()
+  expect(effects.pending('memory', 'kept')).toBe(true)
+  // The runtime stops mid-attempt: the row is left for the next start, so this queue released nothing it is holding.
+  const entered = deferred(), stopping = new Effects(store, new HealthBoard(), () => clock), stopped = vi.fn()
+  stopping.released('relay', stopped)
+  let running = false
+  stopping.handle('relay', async () => { running = true; await entered.promise; throw new Error('the runtime stopped') }, { retry: [1000, 1000] })
+  stopping.enqueue('relay', 'cut', relay('a'))
+  stopping.start()
+  await vi.waitFor(() => expect(running).toBe(true))
+  const drained = stopping.drain()
+  entered.resolve(); await drained
+  expect(stopped).not.toHaveBeenCalled()
+  expect(stopping.pending('relay', 'cut')).toBe(true)
 })
